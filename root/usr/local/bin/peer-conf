@@ -1,0 +1,34 @@
+#!/bin/sh
+# shellcheck shell=sh
+#
+# Print the config a device imports for peer/exit node NAME.
+#   peer-conf <name>          the .conf text
+#   peer-conf <name> --qr     as a QR code in the terminal
+#   peer-conf --list          every defined node
+
+set -u
+
+. /usr/local/bin/backend-functions
+
+case "${1:-}" in
+    ""|-h|--help)
+        echo "Usage: peer-conf <name> [--qr] | peer-conf --list" >&2
+        exit 2 ;;
+    --list|-l)
+        [ -f "$peers_state" ] || { echo "no peers defined" >&2; exit 1; }
+        printf '%-16s %-16s %-6s %-9s %s\n' NAME ADDRESS EXIT GATEWAY ENABLED
+        while IFS= read -r rec; do
+            [ -n "$rec" ] || continue
+            printf '%-16s %-16s %-6s %-9s %s\n' "$(peer_name_of "$rec")" "$(peer_opt "$rec" ip)" \
+                "$(peer_opt "$rec" exit)" "$(peer_effective_gw "$rec")" "$(peer_opt "$rec" enabled)"
+        done < "$peers_state"
+        exit 0 ;;
+esac
+rec="$(peer_record "$1")"
+[ -n "$rec" ] || { echo "unknown peer '$1' (peer-conf --list)" >&2; exit 1; }
+conf="$(peer_client_conf "$rec")"
+if [ "${2:-}" = "--qr" ] || [ "${2:-}" = "-q" ]; then
+    printf '%s\n' "$conf" | grep -v '^#' | qrencode -t ansiutf8
+else
+    printf '%s\n' "$conf"
+fi

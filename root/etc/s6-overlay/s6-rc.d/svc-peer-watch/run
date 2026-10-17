@@ -1,0 +1,25 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+#
+# Optional watcher: re-run wg-reload whenever PEERS_FILE changes
+# (PEERS_WATCH=1). Idles when disabled, so it stays in the s6 bundle.
+
+set -eu
+
+. /usr/local/bin/backend-functions
+
+[ "$peers_watch" = "1" ] || exec sleep infinity
+d="$(dirname "$peers_file")"
+if [ ! -d "$d" ]; then
+    log_error "[PEER-WATCH] Directory $d does not exist; not watching $peers_file"
+    exec sleep infinity
+fi
+log "[PEER-WATCH] Watching $peers_file for changes"
+# Directory watch survives editor rename-replace saves; wg-reload filters
+# events to the watched basenames. The :yw mask (moved in / writable close)
+# avoids feedback from the reload's own reads.
+# svc-wireguard is "started" before wg0 exists; give it a moment so the
+# initial catch-up reload has an interface to sync
+_n=0; while [ "$_n" -lt 20 ] && ! ip link show "$wg_if" >/dev/null 2>&1; do sleep 0.5; _n=$((_n + 1)); done
+/usr/local/bin/wg-reload || true
+exec inotifyd /usr/local/bin/wg-reload "$d:yw"

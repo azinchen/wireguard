@@ -1,0 +1,17 @@
+#!/bin/sh
+# shellcheck shell=sh
+#
+# Re-resolve DNS-named gateways and upstream endpoints; re-route in place
+# when an address moved (see vpngw_reconcile_gateways / upstreams_reconcile).
+# Run manually or every VPN_GATEWAYS_RESOLVE_INTERVAL seconds by the service.
+
+set -u
+
+. /usr/local/bin/backend-functions
+
+[ -d "$vpngw_state_dir" ] || { log_error "[VPNGW-RESOLVE] Not initialised"; exit 1; }
+(
+    flock 9
+    vpngw_reconcile_gateways
+    upstreams_reconcile
+) 9>"$wg_lock"

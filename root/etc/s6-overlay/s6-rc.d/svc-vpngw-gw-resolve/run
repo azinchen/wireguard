@@ -1,0 +1,16 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+#
+# Optional poller that keeps DNS-named gateways and upstream endpoints fresh
+# (VPN_GATEWAYS_RESOLVE_INTERVAL seconds). Idles when disabled.
+
+set -eu
+
+. /usr/local/bin/backend-functions
+
+case "$vpn_gateways_resolve_interval" in ''|*[!0-9]*|0) exec sleep infinity ;; esac
+log "[VPNGW-RESOLVE] Re-resolving gateway hosts and upstream endpoints every ${vpn_gateways_resolve_interval}s"
+while :; do
+    sleep "$vpn_gateways_resolve_interval"
+    /usr/local/bin/vpngw-gw-resolve || true
+done

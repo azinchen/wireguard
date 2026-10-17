@@ -1,0 +1,201 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+#
+# Gateway routing: named gateways (next-hop IPs, exit nodes, upstreams) get a
+# routing table each; the peer -> gateway map becomes source policy rules for
+# the peers' static addresses; a fail-closed nftables kill switch guards every
+# path; LOCAL_GATEWAY steers the container's own traffic (sidecar role).
+# Ported from ocserv-server's init-vpngw with the session layer removed: peer
+# addresses are static, so rules are installed here and reconciled by
+# wg-reload instead of a connect hook.
+
+set -eu
+
+. /usr/local/bin/backend-functions
+
+SCRIPT_NAME="INIT-VPNGW"
+
+fatal() { log_error "[$SCRIPT_NAME] ERROR: $1"; exit 1; }
+
+rm -rf "$vpngw_state_dir"
+mkdir -p "$vpngw_state_dir/applied"
+date +%s > "$vpngw_state_dir/started"
+
+# Clean leftovers of a previous run (service restart inside one container life)
+for prio in "$vpn_gateway_rule_prio" "$vpn_gateway_peer_rule_prio" "$local_gateway_rule_prio"; do
+    for fam in -4 -6; do
+        n=0
+        while [ "$n" -lt 256 ] && ip $fam rule del priority "$prio" 2>/dev/null; do n=$((n + 1)); done
+    done
+done
+
+# ---- Is any egress control configured? ------------------------------------------
+gw_active=0
+[ -n "$vpn_gateway$vpn_gateways$vpn_gateways_file$vpn_peer_gateway$vpn_peer_gateway_file" ] && gw_active=1
+case "$vpn_gateway6" in ""|direct) ;; *) gw_active=1 ;; esac
+[ -s "$state_dir/ifaces/list" ] && gw_active=1
+[ "$local_gateway" != "direct" ] && gw_active=1
+grep -q ' gw=[^-]' "$peers_state" 2>/dev/null && gw_active=1
+
+# ---- Named gateways --------------------------------------------------------------
+# From VPN_GATEWAYS/VPN_GATEWAYS6/VPN_GATEWAYS_FILE, plus every exit node and
+# upstream under its own name (unless VPN_GATEWAYS already names it).
+: > "$vpngw_state_dir/gateways"
+: > "$vpngw_state_dir/gateways.src"
+idx=0
+
+# Resolve a wg:<name> token into "dev:<iface>" or "block" for a family
+dev_token() { # $1 = wg:<name>, $2 = 4|6
+    _n="${1#wg:}"
+    _if="$(awk -v n="$_n" '$1 == n { print $2; exit }' "$state_dir/ifaces/list")"
+    [ -n "$_if" ] || return 1
+    if iface_routes_family "$_if" "$2"; then echo "dev:$_if"; else echo block; fi
+}
+
+add_gateway() { # $1 = name, $2 = tok4, $3 = tok6
+    name="$1"; gw4="$2"; gw6="$3"
+    case "$name" in
+        direct|block|drop|none|default|all) fatal "VPN_GATEWAYS: '$name' is a reserved gateway name" ;;
+        -*|*[!a-zA-Z0-9_-]*) fatal "VPN_GATEWAYS: invalid gateway name '$name' (letters, digits, _, -)" ;;
+    esac
+    grep -q "^$name " "$vpngw_state_dir/gateways" && fatal "gateway '$name' is defined twice"
+    [ "$gw4" = "none" ] && fatal "gateway '$name' has no IPv4 address; use 'block' for an IPv6-only gateway"
+    rgw4="$gw4"; rgw6="$gw6"
+    case "$gw4" in
+        wg:*) rgw4="$(dev_token "$gw4" 4)" || fatal "gateway '$name': no exit node or upstream named '${gw4#wg:}'" ;;
+        block) ;;
+        *) gw_is_literal "$gw4" || rgw4="$(gw_resolve_one -4 "$gw4")" || fatal "gateway '$name': cannot resolve IPv4 host '$gw4'"
+           is_ipv4 "$rgw4" || fatal "gateway '$name': '$gw4' is not an IPv4 address, DNS name, 'block' or wg:<name>" ;;
+    esac
+    case "$gw6" in
+        wg:*) rgw6="$(dev_token "$gw6" 6)" || fatal "gateway '$name': no exit node or upstream named '${gw6#wg:}'" ;;
+        block) ;;
+        *) gw_is_literal "$gw6" || rgw6="$(gw_resolve_one -6 "$gw6")" || fatal "gateway '$name': cannot resolve IPv6 host '$gw6'"
+           is_ipv6 "$rgw6" || fatal "gateway '$name': '$gw6' is not an IPv6 address, DNS name, 'block' or wg:<name>" ;;
+    esac
+    [ "$rgw4" = block ] && [ "$rgw6" = block ] && fatal "gateway '$name' blocks both IPv4 and IPv6; it would route nothing"
+    idx=$((idx + 1))
+    table=$((vpn_gateway_table + idx))
+    if gw_is_dev "$rgw4"; then ip route replace default dev "$(gw_dev_of "$rgw4")" table "$table"
+    elif [ "$rgw4" != block ]; then ip route replace default via "$rgw4" table "$table"; fi
+    if gw_is_dev "$rgw6"; then ip -6 route replace default dev "$(gw_dev_of "$rgw6")" table "$table" || log_error "[$SCRIPT_NAME] Warning: IPv6 route for '$name' failed"
+    elif [ "$rgw6" != block ]; then ip -6 route replace default via "$rgw6" table "$table" || log_error "[$SCRIPT_NAME] Warning: IPv6 route for '$name' failed"; fi
+    printf '%s %s %s\n' "$name" "$gw4" "$gw6" >> "$vpngw_state_dir/gateways.src"
+    printf '%s %s %s %s\n' "$name" "$table" "$rgw4" "$rgw6" >> "$vpngw_state_dir/gateways"
+    log "[$SCRIPT_NAME] Gateway '$name': table $table (v4 $rgw4 / v6 $rgw6)"
+}
+
+if [ -n "$vpn_gateways$vpn_gateways_file" ]; then
+    vpngw_gateways_merged "$vpn_gateways" "$vpn_gateways6" "$vpn_gateways_file" > "$vpngw_state_dir/gateways.tmp"
+    while read -r name tok4 tok6; do
+        [ -n "$name" ] || continue
+        add_gateway "$name" "$tok4" "$tok6"
+    done < "$vpngw_state_dir/gateways.tmp"
+    rm -f "$vpngw_state_dir/gateways.tmp"
+fi
+# Exit nodes and upstreams as gateways of their own name
+while read -r name ifn kind; do
+    [ -n "$name" ] || continue
+    grep -q "^$name " "$vpngw_state_dir/gateways" && continue
+    t6="wg:$name"
+    add_gateway "$name" "wg:$name" "$t6"
+done < "$state_dir/ifaces/list"
+
+# ---- Peer -> gateway map and per-peer validation -------------------------------
+vpngw_build_peer_map || fatal "invalid VPN_PEER_GATEWAY map"
+peers_check_gateways || fatal "peer definitions reference unknown gateways"
+
+# ---- Subnet default for unmapped peers -------------------------------------------
+table="$vpn_gateway_table"
+sub4="-"
+case "$vpn_gateway" in
+    "")    : ;;
+    block) sub4="block" ;;
+    wg:*)  sub4="$(dev_token "$vpn_gateway" 4)" || fatal "VPN_GATEWAY: no exit node or upstream named '${vpn_gateway#wg:}'"
+           [ "$sub4" = block ] && fatal "VPN_GATEWAY: '${vpn_gateway#wg:}' does not carry IPv4"
+           ip route replace default dev "$(gw_dev_of "$sub4")" table "$table" ;;
+    *)     if gw_is_literal "$vpn_gateway"; then sub4="$vpn_gateway"
+           else sub4="$(gw_resolve_one -4 "$vpn_gateway")" || fatal "VPN_GATEWAY: cannot resolve IPv4 host '$vpn_gateway'"; fi
+           is_ipv4 "$sub4" || fatal "VPN_GATEWAY must be an IPv4 address, DNS name, direct, block or wg:<name> (got '$vpn_gateway')"
+           ip route replace default via "$sub4" table "$table" ;;
+esac
+case "$sub4" in
+    -|block) ;;
+    *) log "[$SCRIPT_NAME] Unmapped peers: $vpn_subnet via $sub4 (table $table)"
+       ip rule add from "$vpn_subnet" lookup "$table" priority "$vpn_gateway_rule_prio" ;;
+esac
+# In sidecar mode the local rule (prio 1100, "from all") would also catch
+# unmapped peers; pin them to the main table explicitly when they exit direct
+if [ "$sub4" = "-" ] && [ "$local_gateway" != "direct" ]; then
+    ip rule add from "$vpn_subnet" lookup main priority "$vpn_gateway_rule_prio"
+fi
+sub6="-"
+case "$vpn_gateway6" in
+    "")     [ "$gw_active" = 1 ] || sub6="direct" ;;
+    block)  sub6="block" ;;
+    direct) sub6="direct" ;;
+    wg:*)   sub6="$(dev_token "$vpn_gateway6" 6)" || fatal "VPN_GATEWAY6: no exit node or upstream named '${vpn_gateway6#wg:}'"
+            [ "$sub6" = block ] || ip -6 route replace default dev "$(gw_dev_of "$sub6")" table "$table" ;;
+    *)      if gw_is_literal "$vpn_gateway6"; then sub6="$vpn_gateway6"
+            else sub6="$(gw_resolve_one -6 "$vpn_gateway6")" || fatal "VPN_GATEWAY6: cannot resolve IPv6 host '$vpn_gateway6'"; fi
+            ip -6 route replace default via "$sub6" table "$table" || log_error "[$SCRIPT_NAME] Warning: could not add IPv6 gateway route" ;;
+esac
+case "$sub6" in
+    -|block|direct) ;;
+    *) ip -6 rule add from "$ipv6_subnet" lookup "$table" priority "$vpn_gateway_rule_prio" || log_error "[$SCRIPT_NAME] Warning: could not add IPv6 policy rule" ;;
+esac
+if [ "$sub6" = "direct" ] && [ "$local_gateway" != "direct" ] && ipv6_available; then
+    ip -6 rule add from "$ipv6_subnet" lookup main priority "$vpn_gateway_rule_prio" 2>/dev/null || true
+fi
+printf '%s %s\n' "$sub4" "$sub6" > "$vpngw_state_dir/subnet"
+
+# ---- Sidecar role: the container's own traffic + FORWARD_FROM clients -----------
+if [ "$local_gateway" != "direct" ]; then
+    line="$(gw_line "$local_gateway")"
+    [ -n "$line" ] || fatal "LOCAL_GATEWAY '$local_gateway' is not a defined gateway (VPN_GATEWAYS, exit node or upstream)"
+    ltable="$(echo "$line" | awk '{ print $2 }')"
+    lg4="$(echo "$line" | awk '{ print $3 }')"; lg6="$(echo "$line" | awk '{ print $4 }')"
+    # Locally generated packets (iif lo) except WireGuard's own fwmarked UDP
+    [ "$lg4" != block ] && ip rule add iif lo not fwmark "$wg_fwmark" lookup "$ltable" priority "$local_gateway_rule_prio"
+    if ipv6_available; then
+        if [ "$lg6" != block ]; then
+            ip -6 rule add iif lo not fwmark "$wg_fwmark" lookup "$ltable" priority "$local_gateway_rule_prio" || true
+        else
+            # gateway has no IPv6: send local v6 nowhere (unreachable) rather than the ISP
+            ip -6 rule add iif lo not fwmark "$wg_fwmark" unreachable priority "$local_gateway_rule_prio" 2>/dev/null || true
+        fi
+    fi
+    printf '%s %s\n' "$local_gateway" "$ltable" > "$vpngw_state_dir/local"
+    log "[$SCRIPT_NAME] Local traffic exits via '$local_gateway' (table $ltable); output kill switch armed"
+fi
+
+# ---- Kill switch -------------------------------------------------------------------
+vpngw_load_killswitch || fatal "kill-switch nft rules failed to load"
+log "[$SCRIPT_NAME] Kill switch installed (table inet wg_gw)"
+
+# FORWARD_FROM clients follow LOCAL_GATEWAY like peers mapped to it
+if [ "$local_gateway" != "direct" ] && [ -s "$state_dir/forward_from4" ] || [ -s "$state_dir/forward_from6" ]; then
+    f4="$(paste -sd+ "$state_dir/forward_from4" 2>/dev/null)"; f6="$(paste -sd+ "$state_dir/forward_from6" 2>/dev/null)"
+    vpngw_apply_addrs "forward-from" "$local_gateway" "${f4:--}" "${f6:--}" \
+        || fatal "could not route FORWARD_FROM clients via '$local_gateway'"
+    printf '%s %s %s\n' "$local_gateway" "${f4:--}" "${f6:--}" > "$vpngw_state_dir/applied/_forward_from"
+fi
+
+# ---- Per-peer rules ----------------------------------------------------------------
+n=0
+while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    [ "$(peer_opt "$rec" exit)" = "true" ] && continue
+    [ "$(peer_opt "$rec" enabled)" = "true" ] || continue
+    gw="$(peer_effective_gw "$rec")"
+    [ "$gw" = "-" ] && continue
+    vpngw_apply_peer "$rec" "$gw" || fatal "could not install routing for peer '$(peer_name_of "$rec")'"
+    n=$((n + 1))
+done < "$peers_state"
+cp "$peers_state" "$peers_applied"
+
+if [ "$gw_active" = 1 ]; then
+    log "[$SCRIPT_NAME] Gateway routing active: $(wc -l < "$vpngw_state_dir/gateways") gateway(s), $n mapped peer(s), unmapped -> v4=$sub4 v6=$sub6"
+else
+    log "[$SCRIPT_NAME] No gateway configured; peers exit via the default route"
+fi

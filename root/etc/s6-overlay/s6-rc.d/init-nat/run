@@ -1,0 +1,210 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+#
+# Forwarding sysctls, the forward/NAT table (inet wg), the MSS clamp and the
+# TTL rewrite. Installed before any WireGuard interface exists: the forward
+# chain is policy drop, so nothing can leak while the rest comes up.
+
+set -eu
+
+. /usr/local/bin/backend-functions
+
+SCRIPT_NAME="INIT-NAT"
+
+log "[$SCRIPT_NAME] Initializing forwarding and NAT"
+
+if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]; then
+    if echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null; then
+        log "[$SCRIPT_NAME] IPv4 forwarding enabled"
+    else
+        log_error "[$SCRIPT_NAME] IPv4 forwarding is disabled and /proc/sys is read-only. Add: sysctls: [net.ipv4.ip_forward=1]"
+        exit 1
+    fi
+fi
+if [ "$ipv6_forward" = "1" ] && ipv6_available; then
+    if [ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null)" != "1" ]; then
+        if { echo 1 > /proc/sys/net/ipv6/conf/all/forwarding; } 2>/dev/null; then
+            log "[$SCRIPT_NAME] IPv6 forwarding enabled"
+        else
+            log_error "[$SCRIPT_NAME] Warning: IPv6 forwarding disabled. Use --sysctl net.ipv6.conf.all.forwarding=1"
+        fi
+    fi
+fi
+
+# ---- Egress interfaces of next-hop gateways ---------------------------------
+# An upstream sidecar may sit on a different interface than the WAN (e.g. a
+# bridge while the WAN is a macvlan). Forward and masquerade via each such
+# interface too.
+gw_dev() { # $1 = -4|-6, $2 = IP -> egress interface
+    ip "$1" route get "$2" 2>/dev/null \
+        | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
+}
+gw_addrs() { # every next-hop IP of a family ($1 = -4|-6) across default + named gateways
+    if [ "$1" = "-6" ]; then _def="$vpn_gateway6"; _col=3; else _def="$vpn_gateway"; _col=2; fi
+    {
+        printf '%s\n' "$_def"
+        vpngw_gateways_merged "$vpn_gateways" "$vpn_gateways6" "$vpn_gateways_file" | awk -v c="$_col" '{ print $c }'
+    } | while read -r _tok; do
+        case "$_tok" in ""|block|drop|direct|none|wg|wg:*|dev:*) continue ;; esac
+        if gw_is_literal "$_tok"; then
+            printf '%s\n' "$_tok"
+        elif _ip="$(gw_resolve_one "$1" "$_tok")"; then
+            printf '%s\n' "$_ip"
+        else
+            log_error "[$SCRIPT_NAME] Warning: cannot resolve gateway host '$_tok'"
+        fi
+    done
+}
+gw_ifs=""
+for fam in -4 -6; do
+    for gw in $(gw_addrs $fam); do
+        dev="$(gw_dev $fam "$gw")"
+        if [ -z "$dev" ]; then
+            log_error "[$SCRIPT_NAME] Warning: cannot resolve egress interface for gateway $gw"
+        elif [ "$dev" != "$wan_if" ]; then
+            case " $gw_ifs " in *" $dev "*) ;; *) gw_ifs="$gw_ifs $dev" ;; esac
+        fi
+    done
+done
+printf '%s\n' "$gw_ifs" > "$state_dir/gw_ifs"
+
+# ---- Forward + NAT table ---------------------------------------------------------
+fwd_rules="
+        ct state established,related accept
+        iifname \"$wg_if\" oifname \"$wan_if\" accept
+        iifname \"$wg_if\" oifname \"wg-*\" accept"
+[ "$peer_to_peer" = "true" ] && fwd_rules="$fwd_rules
+        iifname \"$wg_if\" oifname \"$wg_if\" accept"
+nat_rules="
+        ip saddr $vpn_subnet oifname \"$wan_if\" masquerade"
+[ "$ipv6_nat" = "1" ] && nat_rules="$nat_rules
+        ip6 saddr $ipv6_subnet oifname \"$wan_if\" masquerade"
+for dev in $gw_ifs; do
+    log "[$SCRIPT_NAME] Gateway egress via $dev: forwarding + masquerading $vpn_subnet"
+    fwd_rules="$fwd_rules
+        iifname \"$wg_if\" oifname \"$dev\" accept
+        ip saddr @gw_clients4 oifname \"$dev\" accept"
+    nat_rules="$nat_rules
+        ip saddr $vpn_subnet oifname \"$dev\" masquerade
+        ip saddr @gw_clients4 oifname \"$dev\" masquerade"
+    [ "$ipv6_nat" = "1" ] && nat_rules="$nat_rules
+        ip6 saddr $ipv6_subnet oifname \"$dev\" masquerade"
+done
+# Everything entering a tunnel interface is masqueraded onto its address, so
+# the far side (provider, VPS, exit device) needs no route back to our subnets
+if [ "$gateway_nat6" = "true" ]; then
+    nat_rules="$nat_rules
+        oifname \"wg-*\" masquerade"
+else
+    nat_rules="$nat_rules
+        oifname \"wg-*\" meta nfproto ipv4 masquerade"
+fi
+# Sidecar clients (FORWARD_FROM): into any tunnel / gateway egress; the kill
+# switch guards decide which one is legitimate
+fwd_rules="$fwd_rules
+        iifname \"$wan_if\" ip saddr @gw_clients4 oifname \"wg-*\" accept
+        iifname \"$wan_if\" ip6 saddr @gw_clients6 oifname \"wg-*\" accept
+        iifname \"$wan_if\" ip saddr @gw_clients4 oifname \"$wan_if\" accept"
+
+nft delete table inet wg 2>/dev/null || true
+nft -f - <<EOT
+table inet wg {
+    set gw_clients4 { type ipv4_addr; flags interval; }
+    set gw_clients6 { type ipv6_addr; flags interval; }
+    chain forward {
+        type filter hook forward priority 0; policy drop;$fwd_rules
+    }
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;$nat_rules
+    }
+}
+EOT
+
+# FORWARD_FROM clients (sidecar role). "auto" = the kernel-connected prefixes of WAN_IF
+if [ -n "$forward_from$forward_from6" ]; then
+    c4="$(split_list "$forward_from")"
+    case "$c4" in *auto*) c4="$(printf '%s\n' "$c4" | grep -vx auto; ip -4 route show dev "$wan_if" proto kernel | awk '{ print $1 }')" ;; esac
+    c6="$(split_list "$forward_from6")"
+    case "$c6" in *auto*) c6="$(printf '%s\n' "$c6" | grep -vx auto; ip -6 route show dev "$wan_if" proto kernel 2>/dev/null | awk '{ print $1 }' | grep -v '^fe80')" ;; esac
+    l4="$(printf '%s\n' "$c4" | nft_set_literal || true)"
+    l6="$(printf '%s\n' "$c6" | nft_set_literal || true)"
+    [ -n "$l4" ] && nft add element inet wg gw_clients4 "$l4"
+    [ -n "$l6" ] && nft add element inet wg gw_clients6 "$l6"
+    printf '%s\n' "$c4" | sed '/^$/d' > "$state_dir/forward_from4"
+    printf '%s\n' "$c6" | sed '/^$/d' > "$state_dir/forward_from6"
+    log "[$SCRIPT_NAME] Sidecar clients: v4=[$(printf '%s ' $c4 | sed 's/ $//')] v6=[$(printf '%s ' $c6 | sed 's/ $//')]"
+fi
+log "[$SCRIPT_NAME] Forward/NAT table installed (inet wg): $vpn_subnet -> $wan_if$gw_ifs, tunnels masqueraded"
+
+# ---- MSS clamp ---------------------------------------------------------------------
+# Forwarded TCP SYNs are clamped on every egress: to each interface's MTU by
+# default (tunnels: MTU minus 40/60 header bytes), or to the hard cap MSS=<n>.
+# Numeric values throughout: the kernel rejects "rt mtu" in prerouting.
+mss_rules() { # $1 = iifname|oifname
+    for dev in $wan_if $gw_ifs; do
+        if [ -n "$tcp_mss" ]; then
+            printf '%s "%s" tcp flags syn tcp option maxseg size > %s tcp option maxseg size set %s\n' "$1" "$dev" "$tcp_mss" "$tcp_mss"
+        else
+            _mtu="$(cat "/sys/class/net/$dev/mtu" 2>/dev/null)" || continue
+            printf '%s "%s" meta nfproto ipv4 tcp flags syn tcp option maxseg size > %s tcp option maxseg size set %s\n' "$1" "$dev" "$((_mtu - 40))" "$((_mtu - 40))"
+            printf '%s "%s" meta nfproto ipv6 tcp flags syn tcp option maxseg size > %s tcp option maxseg size set %s\n' "$1" "$dev" "$((_mtu - 60))" "$((_mtu - 60))"
+        fi
+    done
+    for pat in "$wg_if" "wg-*"; do
+        if [ -n "$tcp_mss" ]; then
+            printf '%s "%s" tcp flags syn tcp option maxseg size > %s tcp option maxseg size set %s\n' "$1" "$pat" "$tcp_mss" "$tcp_mss"
+        else
+            printf '%s "%s" meta nfproto ipv4 tcp flags syn tcp option maxseg size > %s tcp option maxseg size set %s\n' "$1" "$pat" "$((wg_mtu - 40))" "$((wg_mtu - 40))"
+            printf '%s "%s" meta nfproto ipv6 tcp flags syn tcp option maxseg size > %s tcp option maxseg size set %s\n' "$1" "$pat" "$((wg_mtu - 60))" "$((wg_mtu - 60))"
+        fi
+    done
+}
+nft delete table inet wg_mss 2>/dev/null || true
+nft -f - <<EOT || log_error "[$SCRIPT_NAME] Warning: MSS clamp rules failed to load"
+table inet wg_mss {
+    chain postrouting {
+        type filter hook postrouting priority mangle; policy accept;
+$(mss_rules oifname | awk 'NF { print "        " $0 }')
+    }
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+$(mss_rules iifname | awk 'NF { print "        " $0 }')
+    }
+}
+EOT
+log "[$SCRIPT_NAME] MSS clamp installed (${tcp_mss:-interface MTU})"
+
+# ---- TTL / hop-limit normalization (TTL_SET) ---------------------------------------
+# Forwarded peer traffic leaving via the WAN, a gateway egress interface or a
+# tunnel gets a fresh TTL, hiding every hop behind this node from client
+# traceroutes. Fatal on failure - an exposed topology is worse than a stopped
+# container.
+if [ -n "$ttl_set" ]; then
+    ttl_rules=""
+    for dev in $wan_if $gw_ifs; do
+        ttl_rules="$ttl_rules
+        iifname \"$wg_if\" oifname \"$dev\" ip ttl set $ttl_set
+        ip saddr @gw_clients4 oifname \"$dev\" ip ttl set $ttl_set"
+        [ "$ipv6_forward" = "1" ] && ttl_rules="$ttl_rules
+        iifname \"$wg_if\" oifname \"$dev\" ip6 hoplimit set $ttl_set"
+    done
+    ttl_rules="$ttl_rules
+        oifname \"wg-*\" ip ttl set $ttl_set"
+    [ "$ipv6_forward" = "1" ] && ttl_rules="$ttl_rules
+        oifname \"wg-*\" ip6 hoplimit set $ttl_set"
+    nft delete table inet wg_ttl 2>/dev/null || true
+    if ! nft -f - <<EOT
+table inet wg_ttl {
+    chain postrouting {
+        type filter hook postrouting priority mangle; policy accept;$ttl_rules
+    }
+}
+EOT
+    then
+        log_error "[$SCRIPT_NAME] TTL_SET rules failed to load; refusing to start with the topology exposed"
+        exit 1
+    fi
+    log "[$SCRIPT_NAME] TTL/hop-limit of forwarded traffic set to $ttl_set on egress"
+fi
+
+log "[$SCRIPT_NAME] NAT and forwarding setup complete"

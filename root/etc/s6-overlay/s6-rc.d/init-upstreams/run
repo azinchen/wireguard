@@ -1,0 +1,147 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+#
+# Bring up every second WireGuard interface: managed exit nodes (peers with
+# exit=true, config generated from the peer record) and bring-your-own
+# upstream confs in UPSTREAMS_DIR. Each becomes interface wg-<name> with no
+# routes in the main table; init-vpngw turns them into named gateways.
+# Records $state_dir/ifaces/<iface> = "v4 v6" (yes|no) and
+# $state_dir/ifaces/list = "name iface kind" for init-vpngw.
+
+set -eu
+
+. /usr/local/bin/backend-functions
+
+SCRIPT_NAME="INIT-UPSTREAMS"
+
+fatal() { log_error "[$SCRIPT_NAME] ERROR: $1"; exit 1; }
+
+mkdir -p "$state_dir/ifaces"
+: > "$state_dir/ifaces/list"
+
+# ---- Managed exit nodes ------------------------------------------------------------
+while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    [ "$(peer_opt "$rec" exit)" = "true" ] || continue
+    [ "$(peer_opt "$rec" enabled)" = "true" ] || continue
+    name="$(peer_name_of "$rec")"
+    ifn="wg-$name"
+    exit_conf_build "$rec"
+    conf="$state_dir/$ifn.conf"
+    ep="$(peer_opt "$rec" endpoint)"
+    if [ "$ep" != "-" ]; then
+        host="${ep%:*}"; port="${ep##*:}"
+        host="${host#[}"; host="${host%]}"
+        if gw_is_literal "$host"; then
+            cur="$host"
+        elif cur="$(gw_resolve_one -4 "$host")" || cur="$(gw_resolve_one -6 "$host")"; then
+            log "[$SCRIPT_NAME] Exit node '$name': resolved $host -> $cur"
+        else
+            log_error "[$SCRIPT_NAME] Warning: exit node '$name': cannot resolve '$host' yet; the tunnel waits for the resolver (VPN_GATEWAYS_RESOLVE_INTERVAL)"
+            cur=""
+        fi
+        if [ -n "$cur" ]; then
+            case "$cur" in *:*) epstr="[$cur]:$port" ;; *) epstr="$cur:$port" ;; esac
+            sed -i "s|^Endpoint = .*|Endpoint = $epstr|" "$conf"
+        else
+            sed -i '/^Endpoint = /d' "$conf"
+        fi
+        printf '%s %s %s %s\n' "$(peer_opt "$rec" key)" "$host" "$port" "${cur:-unresolved}" > "$state_dir/ifaces/$ifn.endpoint"
+    fi
+    lip="$(peer_opt "$rec" lip)"; lip6="$(peer_opt "$rec" lip6)"
+    v6addr=""; [ "$lip6" != "-" ] && v6addr="$lip6/128"
+    wg_if_up "$ifn" "$conf" "$lip/32" "$v6addr" "$wg_mtu" || fatal "could not bring up exit node interface $ifn"
+    v6="no"; ipv6_routed && [ "$lip6" != "-" ] && v6="yes"
+    printf 'yes %s\n' "$v6" > "$state_dir/ifaces/$ifn"
+    printf '%s %s exit\n' "$name" "$ifn" >> "$state_dir/ifaces/list"
+    if [ "$ep" != "-" ]; then
+        log "[$SCRIPT_NAME] Exit node '$name' up on $ifn ($lip, dial-out to $ep)"
+    else
+        log "[$SCRIPT_NAME] Exit node '$name' up on $ifn ($lip, dial-in on UDP $(peer_opt "$rec" port))"
+    fi
+done < "$peers_state"
+
+# ---- Bring-your-own upstream confs ------------------------------------------------
+# Standard wg-quick-style files. Accepted: [Interface] PrivateKey, Address,
+# ListenPort, MTU; [Peer] PublicKey, PresharedKey, Endpoint, AllowedIPs,
+# PersistentKeepalive. DNS/Table/hooks are ignored (logged): we route by
+# policy and never execute commands from a downloaded file.
+conf_get() { # $1 = file, $2 = section, $3 = key -> value (first match)
+    awk -v s="[$2]" -v k="$3" '
+        /^[[:space:]]*\[/ { sec = $0; gsub(/[[:space:]]/, "", sec); next }
+        sec == s {
+            line = $0; sub(/#.*/, "", line)
+            if (match(line, "^[[:space:]]*" k "[[:space:]]*=")) {
+                v = substr(line, RLENGTH + 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print v; exit } }' "$1"
+}
+if [ -d "$upstreams_dir" ]; then
+    for f in "$upstreams_dir"/*.conf; do
+        [ -f "$f" ] || continue
+        name="${f##*/}"; name="${name%.conf}"
+        peer_name_valid "$name" && [ "${#name}" -le 12 ] || fatal "upstream file $f: name must be 1-12 chars of letters, digits, _ or - (not reserved)"
+        grep -q "^$name " "$peers_state" && fatal "upstream '$name' clashes with a peer of the same name"
+        ifn="wg-$name"
+        priv="$(conf_get "$f" Interface PrivateKey)"; [ -n "$priv" ] || fatal "upstream $f: [Interface] PrivateKey missing"
+        pub="$(conf_get "$f" Peer PublicKey)";        [ -n "$pub" ]  || fatal "upstream $f: [Peer] PublicKey missing"
+        addr="$(conf_get "$f" Interface Address)"
+        lport="$(conf_get "$f" Interface ListenPort)"
+        mtu="$(conf_get "$f" Interface MTU)"; mtu="${mtu:-$wg_mtu}"
+        psk="$(conf_get "$f" Peer PresharedKey)"
+        ep="$(conf_get "$f" Peer Endpoint)"
+        allowed="$(conf_get "$f" Peer AllowedIPs)"
+        ka="$(conf_get "$f" Peer PersistentKeepalive)"
+        [ "$(grep -c '^\[Peer\]' "$f")" -le 1 ] || log_error "[$SCRIPT_NAME] Warning: upstream $f has several [Peer] sections; only the first is used"
+        for ign in DNS Table PreUp PostUp PreDown PostDown SaveConfig; do
+            [ -z "$(conf_get "$f" Interface "$ign")" ] || log "[$SCRIPT_NAME] upstream '$name': ignoring $ign= (routing is policy-based; hooks are never executed)"
+        done
+        a4=""; a6=""
+        for a in $(printf '%s' "$addr" | tr ',' ' '); do
+            case "$a" in */*) ;; *:*) a="$a/128" ;; *) a="$a/32" ;; esac
+            if is_cidr4 "$a"; then a4="${a4:-$a}"; elif is_cidr6 "$a"; then a6="${a6:-$a}"; fi
+        done
+        [ -n "$a4" ] || [ -n "$a6" ] || fatal "upstream $f: [Interface] Address missing"
+        r4=no; r6=no
+        for a in $(printf '%s' "$allowed" | tr ',' ' '); do
+            is_cidr4 "$a" && [ -n "$a4" ] && r4=yes
+            is_cidr6 "$a" && [ -n "$a6" ] && ipv6_available && r6=yes
+        done
+        [ "$r4" = yes ] || [ "$r6" = yes ] || fatal "upstream $f: [Peer] AllowedIPs must include a route (e.g. 0.0.0.0/0)"
+        conf="$state_dir/$ifn.conf"
+        cur=""
+        epline=""
+        if [ -n "$ep" ]; then
+            host="${ep%:*}"; port="${ep##*:}"; host="${host#[}"; host="${host%]}"
+            is_number "$port" || fatal "upstream $f: Endpoint must be host:port"
+            if gw_is_literal "$host"; then cur="$host"
+            elif cur="$(gw_resolve_one -4 "$host")" || cur="$(gw_resolve_one -6 "$host")"; then
+                log "[$SCRIPT_NAME] Upstream '$name': resolved $host -> $cur"
+            else
+                log_error "[$SCRIPT_NAME] Warning: upstream '$name': cannot resolve '$host' yet; the tunnel waits for the resolver"
+            fi
+            if [ -n "$cur" ]; then
+                case "$cur" in *:*) epline="Endpoint = [$cur]:$port" ;; *) epline="Endpoint = $cur:$port" ;; esac
+            fi
+            printf '%s %s %s %s\n' "$pub" "$host" "$port" "${cur:-unresolved}" > "$state_dir/ifaces/$ifn.endpoint"
+        fi
+        {
+            echo "[Interface]"
+            echo "PrivateKey = $priv"
+            [ -n "$lport" ] && echo "ListenPort = $lport"
+            echo "FwMark = $wg_fwmark"
+            echo
+            echo "[Peer]"
+            echo "PublicKey = $pub"
+            [ -n "$psk" ] && echo "PresharedKey = $psk"
+            echo "AllowedIPs = $allowed"
+            [ -n "$epline" ] && echo "$epline"
+            [ -n "$ka" ] && echo "PersistentKeepalive = $ka"
+        } > "$conf.new" && chmod 600 "$conf.new" && mv "$conf.new" "$conf"
+        wg_if_up "$ifn" "$conf" "${a4:-$a6}" "$([ -n "$a4" ] && echo "$a6")" "$mtu" || fatal "could not bring up upstream interface $ifn"
+        printf '%s %s\n' "$r4" "$r6" > "$state_dir/ifaces/$ifn"
+        printf '%s %s upstream\n' "$name" "$ifn" >> "$state_dir/ifaces/list"
+        log "[$SCRIPT_NAME] Upstream '$name' up on $ifn (${a4:-}${a4:+ }${a6:-}; v4=$r4 v6=$r6${ep:+; endpoint $ep})"
+    done
+fi
+
+n="$(wc -l < "$state_dir/ifaces/list")"
+log "[$SCRIPT_NAME] $n tunnel interface(s) up ($(cat "$state_dir/backend" 2>/dev/null || echo 'none created'))"

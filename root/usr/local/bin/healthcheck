@@ -1,0 +1,81 @@
+#!/bin/sh
+# shellcheck shell=sh
+#
+# Side-effect-free liveness probe for the Docker HEALTHCHECK instruction.
+# Opt-in: reports healthy unless HEALTH_CHECK_ENABLED=true.
+#   always          wg0 exists and answers, listening on LISTEN_PORT
+#   automatically   nft tables present (forward/NAT, kill switch)
+#   opt-in          HEALTH_CHECK_EGRESS: direct, default, gateway names,
+#                   "upstreams" (handshake freshness), or all
+
+set -u
+
+. /usr/local/bin/backend-functions
+
+[ "$health_check_enabled" = "true" ] || exit 0
+
+PROBE_TABLE="wg_health"; PROBE_MARK="0xd1a7"; PROBE_PRIO=791; PROBE_TIMEOUT=4
+
+fail() { echo "unhealthy: $*"; exit 1; }
+
+ip link show "$wg_if" >/dev/null 2>&1 || fail "$wg_if does not exist"
+wg show "$wg_if" listen-port >/dev/null 2>&1 || fail "wg show $wg_if failed"
+[ "$(wg show "$wg_if" listen-port 2>/dev/null)" = "$listen_port" ] || fail "$wg_if is not listening on $listen_port"
+nft list table inet wg >/dev/null 2>&1 || fail "forward/NAT table (inet wg) missing"
+nft list table inet wg_gw >/dev/null 2>&1 || fail "kill-switch table (inet wg_gw) missing"
+
+EGRESS_OK=""
+direct_ok() {
+    for _u in $(split_list "$health_check_url"); do
+        curl -fsS --max-time 4 -o /dev/null "$_u" 2>/dev/null && return 0
+    done
+    return 1
+}
+gateway_ok() { # $1 = name, $2 = table, $3 = gw4, $4 = gw6
+    [ "$3" != "block" ] && { probe_table_raw "$2" 4 >/dev/null || fail "egress via gateway '$1' (table $2) failed for IPv4"; }
+    [ "$4" != "block" ] && { probe_table_raw "$2" 6 >/dev/null || fail "egress via gateway '$1' (table $2) failed for IPv6"; }
+    return 0
+}
+upstreams_ok() {
+    for _ef in "$state_dir"/ifaces/*.endpoint; do
+        [ -f "$_ef" ] || continue
+        _ifn="${_ef##*/}"; _ifn="${_ifn%.endpoint}"
+        _age="$(wg_handshake_age "$_ifn")" || fail "$_ifn has never completed a handshake"
+        [ "$_age" -le "$upstream_handshake_timeout" ] || fail "$_ifn: last handshake ${_age}s ago"
+    done
+}
+
+if [ -n "$health_check_egress" ]; then
+    trap probe_cleanup EXIT INT TERM
+    _paths="$(printf '%s' "$health_check_egress" | tr '+,' '  ')"
+    case " $_paths " in *" all "*)
+        _paths="direct upstreams"
+        read -r _s4 _ < "$vpngw_state_dir/subnet" 2>/dev/null || _s4="-"
+        case "$_s4" in -|block) ;; *) _paths="$_paths default" ;; esac
+        _paths="$_paths $(awk '{ printf "%s ", $1 }' "$vpngw_state_dir/gateways" 2>/dev/null)" ;;
+    esac
+    for _p in $_paths; do
+        case "$_p" in
+            direct)    direct_ok || fail "direct egress failed (${health_check_url%%[;,]*})" ;;
+            upstreams) upstreams_ok ;;
+            default)
+                read -r _s4 _s6 < "$vpngw_state_dir/subnet" 2>/dev/null || { _s4="-"; _s6="-"; }
+                case "${_s4:--}" in -|block) _s4="block" ;; esac
+                case "${_s6:--}" in -|block|direct) _s6="block" ;; esac
+                [ "$_s4$_s6" = "blockblock" ] && fail "HEALTH_CHECK_EGRESS lists 'default' but no default gateway routes anything"
+                probe_arm || fail "could not install the probe chain"
+                gateway_ok default "$vpn_gateway_table" "$_s4" "$_s6" ;;
+            *)
+                _line="$(gw_line "$_p")"
+                [ -n "$_line" ] || fail "HEALTH_CHECK_EGRESS lists unknown gateway '$_p'"
+                probe_arm || fail "could not install the probe chain"
+                gateway_ok "$_p" "$(echo "$_line" | awk '{ print $2 }')" "$(echo "$_line" | awk '{ print $3 }')" "$(echo "$_line" | awk '{ print $4 }')" ;;
+        esac
+        EGRESS_OK="$EGRESS_OK${EGRESS_OK:+,}$_p"
+    done
+    probe_cleanup
+fi
+
+_online="$(wg show "$wg_if" latest-handshakes 2>/dev/null | awk -v now="$(date +%s)" '$2 > 0 && now - $2 < 180' | wc -l)"
+echo "healthy: $wg_if up, $(wg show "$wg_if" peers 2>/dev/null | wc -l) peer(s), $_online online${EGRESS_OK:+; egress ok: $EGRESS_OK}"
+exit 0

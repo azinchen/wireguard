@@ -1,0 +1,262 @@
+#!/bin/sh
+# shellcheck shell=sh
+#
+# network-diagnostic: POSIX sh diagnostics for the wireguard container.
+# Usage: network-diagnostic [--basic|-b] | [--full|-f] | [--json|-j]
+#                           | [--explain|-e PEER] | [--help|-h]
+# Shows interfaces, effective configuration, gateways with egress probes
+# (public IP as seen through each routing table), peers with handshakes and
+# traffic, policy routing and the nftables tables. Non-zero exit when any
+# [warn] was raised. Egress probes use the shared fwmark machinery (table
+# inet wg_diag) and never touch live rules.
+
+set -u
+
+MODE="full"; EXPLAIN=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -b|--basic) MODE=basic ;;
+        -f|--full) MODE=full ;;
+        -j|--json) MODE=json ;;
+        -e|--explain) MODE=explain; EXPLAIN="${2:-}"; [ -n "$EXPLAIN" ] || { echo "--explain needs a peer name" >&2; exit 2; }; shift ;;
+        -h|--help) echo "Usage: network-diagnostic [-b|--basic] [-f|--full] [-j|--json] [-e|--explain PEER]"; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+. /usr/local/bin/backend-functions
+
+WARNS="/tmp/wg-diag-warns.$$"
+GEO="/tmp/wg-diag-geo.$$"
+trap 'rm -f "$WARNS" "$GEO"; probe_cleanup' EXIT INT TERM
+
+hr() { echo "================================================================"; }
+section() { echo "### $1"; }
+ok() { echo "[ok] $*"; }
+info() { echo "[info] $*"; }
+note_warn() { printf '%s\n' "$*" >> "$WARNS"; }
+warn() { note_warn "$*"; echo "[warn] $*"; }
+warn_count() { [ -f "$WARNS" ] && wc -l < "$WARNS" || echo 0; }
+jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+trace_field() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1; }
+geo_of() { # $1 = ip -> "City, CC - org" (cached, best effort, direct path)
+    _h="$(awk -v ip="$1" '$1 == ip { $1 = ""; sub(/^ /, ""); print; exit }' "$GEO" 2>/dev/null)"
+    [ -n "$_h" ] && { [ "$_h" = "-" ] || printf '%s\n' "$_h"; return 0; }
+    _r="$(curl -fsS --max-time 4 "https://ipinfo.io/$1/json" 2>/dev/null)" || _r=""
+    _city="$(printf '%s\n' "$_r" | sed -n 's/.*"city"[: ]*"\([^"]*\)".*/\1/p' | head -1)"
+    _cc="$(printf '%s\n' "$_r" | sed -n 's/.*"country"[: ]*"\([^"]*\)".*/\1/p' | head -1)"
+    _org="$(printf '%s\n' "$_r" | sed -n 's/.*"org"[: ]*"\([^"]*\)".*/\1/p' | head -1)"
+    _o=""; [ -n "$_city" ] && _o="$_city"; [ -n "$_cc" ] && _o="${_o:+$_o, }$_cc"; [ -n "$_org" ] && _o="${_o:+$_o - }$_org"
+    echo "$1 ${_o:--}" >> "$GEO"
+    [ -n "$_o" ] && printf '%s\n' "$_o"; return 0
+}
+trace_pretty() { _ip="$(trace_field "$1" ip)"; [ -n "$_ip" ] || return 1; _g="$(geo_of "$_ip")"; printf '%s (%s)\n' "$_ip" "${_g:-$(trace_field "$1" loc)}"; }
+probe_via_table() { _b="$(probe_table_raw "$1" "$2")" || return 1; trace_pretty "$_b"; }
+hb() { awk -v b="$1" 'BEGIN { u = "B"; if (b >= 1024) { b /= 1024; u = "K" } if (b >= 1024) { b /= 1024; u = "M" } if (b >= 1024) { b /= 1024; u = "G" } if (u == "B") printf "%d%s", b, u; else printf "%.1f%s", b, u }'; }
+age_fmt() { awk -v s="$1" 'BEGIN { if (s < 0) s = 0; if (s < 120) printf "%ds", s; else if (s < 7200) printf "%dm", s / 60; else if (s < 172800) printf "%dh", s / 3600; else printf "%dd", s / 86400 }'; }
+
+WG_UP=0; ip link show "$wg_if" >/dev/null 2>&1 && WG_UP=1
+SUB4="-"; SUB6="-"; [ -f "$vpngw_state_dir/subnet" ] && { read -r SUB4 SUB6 < "$vpngw_state_dir/subnet" || true; }
+NOW="$(date +%s)"
+PEERS_N="$(grep -c ' exit=false' "$peers_state" 2>/dev/null || echo 0)"
+ONLINE="$(wg show "$wg_if" latest-handshakes 2>/dev/null | awk -v now="$NOW" '$2 > 0 && now - $2 < 180' | wc -l)"
+
+# ---- Explain ------------------------------------------------------------------------
+if [ "$MODE" = explain ]; then
+    rec="$(peer_record "$EXPLAIN")" || true
+    [ -n "$rec" ] || { echo "unknown peer '$EXPLAIN'" >&2; exit 1; }
+    gw="$(peer_effective_gw "$rec")"
+    src="$(peer_opt "$rec" ip)"
+    case "$gw" in
+        direct) echo "$EXPLAIN ($src) is mapped 'direct': exits via the container default route ($wan_if)" ;;
+        block)  echo "$EXPLAIN ($src) is blocked: forwarded traffic is rejected" ;;
+        -)      case "$SUB4" in
+                    -)     echo "$EXPLAIN ($src) is unmapped: exits via the container default route ($wan_if)" ;;
+                    block) echo "$EXPLAIN ($src) is unmapped and the subnet default is block: rejected" ;;
+                    dev:*) echo "$EXPLAIN ($src) is unmapped: subnet default via tunnel ${SUB4#dev:} (table $vpn_gateway_table)" ;;
+                    *)     echo "$EXPLAIN ($src) is unmapped: subnet default via next-hop $SUB4 (table $vpn_gateway_table)" ;;
+                esac ;;
+        *)      l="$(gw_line "$gw")"
+                echo "$EXPLAIN ($src) -> gateway '$gw': table $(echo "$l" | awk '{ print $2 }'), v4 $(echo "$l" | awk '{ print $3 }'), v6 $(echo "$l" | awk '{ print $4 }')"
+                echo "  policy rules:"; { ip rule show; ip -6 rule show; } | grep -E "[[:space:]]from $src(/|[[:space:]])" | sed 's/^/    /' ;;
+    esac
+    exit 0
+fi
+
+# ---- Basic ------------------------------------------------------------------------------
+if [ "$MODE" = basic ]; then
+    b="$(fetch_url "$PROBE_TRACE4")" || b=""
+    d=""; [ -n "$b" ] && d="$(trace_pretty "$b")"
+    [ -n "$d" ] || note_warn "direct egress UNREACHABLE"
+    echo "wireguard: $wg_if $([ "$WG_UP" = 1 ] && echo up || echo DOWN), $PEERS_N peer(s), $ONLINE online; direct egress: ${d:-UNREACHABLE}"
+    if [ -s "$vpngw_state_dir/gateways" ] && probe_arm; then
+        while read -r n t g4 g6; do
+            [ -n "$n" ] || continue
+            r="v4 blocked"; [ "$g4" != block ] && { r="$(probe_via_table "$t" 4)" || { r=UNREACHABLE; note_warn "gateway $n v4 egress UNREACHABLE"; }; }
+            [ "$g6" != block ] && { r6="$(probe_via_table "$t" 6)" || { r6=UNREACHABLE; note_warn "gateway $n v6 egress UNREACHABLE"; }; r="$r / v6: $r6"; }
+            echo "gateway $n: $r"
+        done < "$vpngw_state_dir/gateways"
+        probe_cleanup
+    fi
+    [ "$WG_UP" = 1 ] && [ "$(warn_count)" = 0 ]
+    exit $?
+fi
+
+# ---- JSON ---------------------------------------------------------------------------------
+if [ "$MODE" = json ]; then
+    jg=""
+    if [ -s "$vpngw_state_dir/gateways" ] && probe_arm; then
+        while read -r n t g4 g6; do
+            [ -n "$n" ] || continue
+            e4=null; e6=null
+            [ "$g4" != block ] && { r="$(probe_via_table "$t" 4)" && e4="\"$(jesc "$r")\"" || { e4='"UNREACHABLE"'; note_warn "gateway $n v4 egress UNREACHABLE"; }; }
+            [ "$g6" != block ] && { r="$(probe_via_table "$t" 6)" && e6="\"$(jesc "$r")\"" || { e6='"UNREACHABLE"'; note_warn "gateway $n v6 egress UNREACHABLE"; }; }
+            jg="$jg,{\"name\":\"$(jesc "$n")\",\"table\":$t,\"ipv4\":\"$g4\",\"ipv6\":\"$g6\",\"egress4\":$e4,\"egress6\":$e6}"
+        done < "$vpngw_state_dir/gateways"
+        probe_cleanup
+    fi
+    d4=null; b="$(fetch_url "$PROBE_TRACE4")" && d4="\"$(jesc "$(trace_pretty "$b")")\""
+    d6=null; b="$(fetch_url "$PROBE_TRACE6")" && d6="\"$(jesc "$(trace_pretty "$b")")\""
+    peers_json="$(peer-report --json 2>/dev/null | sed 's/^.*"peers":\[\(.*\)\]}$/\1/')"
+    nat=false; nft list table inet wg >/dev/null 2>&1 && nat=true
+    ks=false; nft list table inet wg_gw >/dev/null 2>&1 && ks=true
+    [ "$WG_UP" = 1 ] || note_warn "$wg_if is down"
+    printf '{"image":{"version":"%s","built":"%s"},"interface":{"name":"%s","up":%s,"listen_port":%s,"backend":"%s","peers":%s,"online":%s},"config":{"vpn_subnet":"%s","wan_if":"%s","local_gateway":"%s","subnet_default":{"v4":"%s","v6":"%s"}},"direct":{"egress4":%s,"egress6":%s},"gateways":[%s],"peers":[%s],"tables":{"nat":%s,"killswitch":%s},"warnings":%s}\n' \
+        "$(jesc "$image_version")" "$(jesc "$image_build_date")" "$wg_if" "$([ "$WG_UP" = 1 ] && echo true || echo false)" "$listen_port" \
+        "$(cat "$state_dir/backend" 2>/dev/null || echo none)" "$PEERS_N" "$ONLINE" "$vpn_subnet" "$wan_if" "$local_gateway" "$SUB4" "$SUB6" \
+        "$d4" "$d6" "${jg#,}" "$peers_json" "$nat" "$ks" "$(warn_count)"
+    [ "$(warn_count)" = 0 ]
+    exit $?
+fi
+
+# ---- Full ----------------------------------------------------------------------------------
+hr
+echo "wireguard DIAG (full)     : $(date -Is 2>/dev/null || date)"
+echo "Image                     : $image_version (built $image_build_date)"
+echo "Kernel                    : $(uname -r)"
+echo "WireGuard                 : $(wg --version 2>/dev/null) ($(cat "$state_dir/backend" 2>/dev/null || echo 'no interface created'))"
+echo "Interface                 : $wg_if $([ "$WG_UP" = 1 ] && echo "up, UDP $listen_port" || echo DOWN)"
+echo "Peers                     : $PEERS_N defined, $ONLINE online (handshake < 3 min)"
+echo
+[ "$WG_UP" = 1 ] || warn "$wg_if is down"
+
+section "Effective configuration (env)"
+echo "VPN_SUBNET / IPV6_SUBNET       : $vpn_subnet / $ipv6_subnet (nat6: $ipv6_nat, routed: $(ipv6_routed && echo yes || echo no))"
+echo "EXIT_SUBNET                    : $exit_subnet"
+echo "LISTEN_PORT / MTU / MSS        : $listen_port / $wg_mtu / ${tcp_mss:-<interface MTU>}"
+echo "SERVER_ENDPOINT                : ${server_endpoint:-<unset - device configs carry a placeholder>}"
+echo "WAN_IF (detected)              : $wan_if"
+echo "PEERS / PEERS_FILE             : ${peers:-<unset>} / $peers_file ($([ -f "$peers_file" ] && echo present || echo absent); watch: $peers_watch)"
+echo "VPN_GATEWAY / VPN_GATEWAY6     : ${vpn_gateway:-<unset>} / ${vpn_gateway6:-<unset>}"
+echo "VPN_GATEWAYS / 6 / FILE        : ${vpn_gateways:-<unset>} / ${vpn_gateways6:-<unset>} / ${vpn_gateways_file:-<unset>}"
+echo "VPN_PEER_GATEWAY / FILE        : ${vpn_peer_gateway:-<unset>} / ${vpn_peer_gateway_file:-<unset>} (watch: $vpn_peer_gateway_watch)"
+echo "VPN_GATEWAYS_RESOLVE_INTERVAL  : $vpn_gateways_resolve_interval"
+echo "LOCAL_GATEWAY                  : $local_gateway"
+echo "FORWARD_FROM / FORWARD_FROM6   : ${forward_from:-<unset>} / ${forward_from6:-<unset>}"
+echo "NETWORK / NETWORK6             : ${network:-<unset>} / ${network6:-<unset>}"
+echo "TTL_SET                        : ${ttl_set:-<unset>}"
+echo "HEALTH_CHECK_ENABLED / EGRESS  : $health_check_enabled / ${health_check_egress:-<unset>}"
+echo
+
+section "Interfaces"
+for i in $(ip -o link show 2>/dev/null | awk -F': ' '{ print $2 }' | sed 's/@.*//' | grep -E "^($wg_if|wg-)"); do
+    a4="$(ip -4 -o addr show dev "$i" 2>/dev/null | awk '{ print $4 }' | paste -sd, -)"
+    a6="$(ip -6 -o addr show dev "$i" scope global 2>/dev/null | awk '{ print $4 }' | paste -sd, -)"
+    mtu="$(cat "/sys/class/net/$i/mtu" 2>/dev/null)"
+    lp="$(wg show "$i" listen-port 2>/dev/null)"
+    hs="$(wg show "$i" latest-handshakes 2>/dev/null | awk -v now="$NOW" 'BEGIN { m = -1 } $2 > 0 { a = now - $2; if (m < 0 || a < m) m = a } END { print m }')"
+    hsd="never"; [ "${hs:--1}" -ge 0 ] && hsd="$(age_fmt "$hs") ago"
+    printf '%-14s %-32s mtu %-5s port %-6s peers %-3s last handshake %s\n' "$i" "${a4:-}${a6:+,$a6}" "$mtu" "${lp:--}" "$(wg show "$i" peers 2>/dev/null | wc -l)" "$hsd"
+done
+echo
+
+section "Gateways"
+if [ -s "$vpngw_state_dir/gateways" ]; then
+    echo "subnet default (unmapped peers) : v4=$SUB4 v6=$SUB6 (table $vpn_gateway_table)"
+    [ -f "$vpngw_state_dir/local" ] && echo "local traffic (LOCAL_GATEWAY)   : $(cat "$vpngw_state_dir/local")"
+    printf '%-12s %-6s %-20s %s\n' gateway table ipv4 ipv6
+    while read -r n t g4 g6; do [ -n "$n" ] && printf '%-12s %-6s %-20s %s\n' "$n" "$t" "$g4" "$g6"; done < "$vpngw_state_dir/gateways"
+    if [ -f "$vpngw_state_dir/gateways.src" ]; then
+        while read -r n s4 s6; do
+            [ -n "$n" ] || continue
+            for fam in 4 6; do
+                eval "s=\$s$fam"
+                gw_is_literal "$s" && continue
+                pin="$(gw_line "$n" | awk -v f="$fam" '{ print (f == 4) ? $3 : $4 }')"
+                now_r="$(gw_resolve_all "-$fam" "$s")"
+                if [ -z "$now_r" ]; then warn "gateway $n v$fam: '$s' does not resolve right now (routing keeps $pin)"
+                elif printf '%s\n' "$now_r" | grep -qxF "$pin"; then ok "gateway $n v$fam: '$s' resolves to the pinned next-hop $pin"
+                else warn "gateway $n v$fam: '$s' now resolves to $(printf '%s\n' "$now_r" | head -1) but routing pins $pin - run vpngw-gw-resolve"; fi
+            done
+        done < "$vpngw_state_dir/gateways.src"
+    fi
+    for ef in "$state_dir"/ifaces/*.endpoint; do
+        [ -f "$ef" ] || continue
+        i="${ef##*/}"; i="${i%.endpoint}"
+        read -r _ h p cur < "$ef" || continue
+        a="$(wg_handshake_age "$i" 2>/dev/null)" || a=""
+        if [ -z "$a" ]; then warn "$i: no handshake yet with $h:$p ($cur)"
+        elif [ "$a" -gt "$upstream_handshake_timeout" ]; then warn "$i: last handshake $(age_fmt "$a") ago ($h:$p -> $cur)"
+        else ok "$i: handshake $(age_fmt "$a") ago with $h:$p ($cur)"; fi
+    done
+    echo
+    section "Egress probes (public IP via each routing table)"
+    if probe_arm; then
+        r="$(probe_via_table main 4)" || { r=UNREACHABLE; [ "$local_gateway" = direct ] && note_warn "direct egress UNREACHABLE"; }
+        printf '%-26s : %s\n' "direct (main table)" "$r"
+        r="$(probe_via_table main 6)" || r="no IPv6 egress"; printf '%-26s : %s\n' "direct v6 (main table)" "$r"
+        case "$SUB4" in -|block) ;; *) r="$(probe_via_table "$vpn_gateway_table" 4)" || { r=UNREACHABLE; note_warn "default gateway v4 egress UNREACHABLE"; }; printf '%-26s : %s\n' "default (table $vpn_gateway_table)" "$r" ;; esac
+        while read -r n t g4 g6; do
+            [ -n "$n" ] || continue
+            if [ "$g4" != block ]; then r="$(probe_via_table "$t" 4)" || { r=UNREACHABLE; note_warn "gateway $n v4 egress UNREACHABLE"; }; printf '%-26s : %s\n' "$n (table $t) v4" "$r"; else printf '%-26s : %s\n' "$n v4" "blocked (by config)"; fi
+            if [ "$g6" != block ]; then r="$(probe_via_table "$t" 6)" || { r=UNREACHABLE; note_warn "gateway $n v6 egress UNREACHABLE"; }; printf '%-26s : %s\n' "$n v6" "$r"; else printf '%-26s : %s\n' "$n v6" "blocked (by config)"; fi
+        done < "$vpngw_state_dir/gateways"
+        probe_cleanup
+    else
+        info "could not install the probe chain; egress probes skipped"
+    fi
+else
+    echo "no gateways; peers exit via the default route"
+    b="$(fetch_url "$PROBE_TRACE4")" && echo "direct egress: $(trace_pretty "$b")" || warn "direct egress UNREACHABLE"
+fi
+echo
+
+section "Peers"
+peer-report 2>/dev/null | tail -n +2
+# Integrity: every mapped peer must have its rule and set entry
+if [ -d "$vpngw_state_dir/applied" ]; then
+    rules="$(ip rule show; ip -6 rule show 2>/dev/null)"
+    for f in "$vpngw_state_dir"/applied/*; do
+        [ -f "$f" ] || continue
+        n="${f##*/}"; read -r g a4 _ < "$f" || continue
+        for c in $(printf '%s' "$a4" | tr '+' ' '); do
+            [ "$c" = "-" ] && continue
+            [ "$g" = block ] && continue
+            printf '%s\n' "$rules" | grep -q "from ${c%/32} " || printf '%s\n' "$rules" | grep -q "from $c " || warn "peer $n: policy rule for $c missing (gateway $g)"
+        done
+    done
+fi
+echo
+
+section "Policy routing"
+ip rule show
+ip -6 rule show 2>/dev/null | grep -v '^0:\|^32766:\|^32767:' || true
+for t in $(ip rule show | sed -n 's/.*lookup \([0-9]*\).*/\1/p' | sort -un); do
+    echo "table $t: $(ip route show table "$t" 2>/dev/null | paste -sd';' -)"
+done
+echo
+
+section "nftables"
+for t in wg wg_gw wg_mss wg_ttl; do
+    nft list table inet "$t" 2>/dev/null || { [ "$t" = wg_ttl ] || warn "table inet $t missing"; }
+done
+echo
+hr
+if [ "$(warn_count)" = 0 ]; then
+    echo "Quick verdict: OK"
+else
+    echo "Quick verdict: $(warn_count) warning(s)"
+    sed 's/^/  - /' "$WARNS"
+    exit 1
+fi
