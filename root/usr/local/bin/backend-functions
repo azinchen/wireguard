@@ -1,0 +1,1442 @@
+#!/bin/sh
+# shellcheck shell=sh
+#
+# Shared environment parsing and helpers, sourced by every script in the
+# image. Boolean flags are normalized to "true"/"false" (accepting "true" or
+# "1"), so consumers only ever compare against "true".
+
+# Substituted at image build time (safe_sed in the Dockerfile's rootfs stage):
+# CI passes the image tag ('dev' for main, the version for releases) and a UTC
+# build timestamp; a local docker build without build-args yields N/A. A value
+# still carrying the "__" prefix means an unsubstituted dev copy (script
+# bind-mounted from the repo) - fall back to N/A instead of the placeholder.
+image_version="__IMAGE_VERSION__"
+image_build_date="__BUILD_DATE__"
+case "$image_version" in __*) image_version="N/A" ;; esac
+case "$image_build_date" in __*) image_build_date="N/A" ;; esac
+
+to_bool() { case "${1:-}" in true|1) echo "true" ;; *) echo "false" ;; esac; }
+
+# ---- Core networking -------------------------------------------------------
+vpn_subnet="${VPN_SUBNET:-10.10.10.0/24}"
+listen_port="${LISTEN_PORT:-51820}"
+server_endpoint="${SERVER_ENDPOINT:-}"
+wg_mtu="${MTU:-1420}"
+tcp_mss="${MSS:-}"
+ttl_set="${TTL_SET:-}"
+ttl_inc="${TTL_INC:-}"
+peer_to_peer="$(to_bool "${PEER_TO_PEER:-true}")"
+wan_if="${WAN_IF:-}"
+if [ -z "$wan_if" ]; then
+    # Auto-detect the WAN interface from the IPv4 default route. In a plain
+    # bridge network that is eth0, but with extra networks attached (e.g. a
+    # macvlan for the ISP uplink) the ISP-facing interface may be eth1 or
+    # later - Docker attaches networks in lexicographic order, so the name is
+    # not stable. The default route always points out the "outside".
+    wan_if="$(ip -4 route show default 2>/dev/null \
+        | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
+    wan_if="${wan_if:-eth0}"
+fi
+
+# ---- IPv6 ------------------------------------------------------------------
+ipv6_forward="${IPV6_FORWARD:-1}"
+ipv6_nat="${IPV6_NAT:-0}"
+ipv6_subnet="${IPV6_SUBNET:-fda9:4efe:7e3b:03ea::/64}"
+
+# ---- Peers (wg0) -----------------------------------------------------------
+peers="${PEERS:-}"
+peers_file="${PEERS_FILE:-/etc/wireguard/peers.conf}"
+peers_watch="${PEERS_WATCH:-0}"
+peer_dns="${PEER_DNS:-1.1.1.1,1.0.0.1}"
+peer_routes="${PEER_ROUTES:-0.0.0.0/0,::/0}"
+peer_keepalive="${PEER_KEEPALIVE:-25}"
+
+# ---- Gateway mode (same contract as ocserv-server, USER -> PEER) -----------
+vpn_gateway="${VPN_GATEWAY:-}"
+vpn_gateway6="${VPN_GATEWAY6:-}"
+vpn_gateway_table="${VPN_GATEWAY_TABLE:-100}"
+vpn_gateway_rule_prio="${VPN_GATEWAY_RULE_PRIO:-1000}"
+vpn_gateways="${VPN_GATEWAYS:-}"
+vpn_gateways6="${VPN_GATEWAYS6:-}"
+vpn_gateways_file="${VPN_GATEWAYS_FILE:-}"
+vpn_gateways_resolve_interval="${VPN_GATEWAYS_RESOLVE_INTERVAL:-0}"
+vpn_peer_gateway="${VPN_PEER_GATEWAY:-}"
+vpn_peer_gateway_file="${VPN_PEER_GATEWAY_FILE:-}"
+vpn_peer_gateway_watch="${VPN_PEER_GATEWAY_WATCH:-0}"
+vpn_gateway_peer_rule_prio="${VPN_GATEWAY_PEER_RULE_PRIO:-900}"
+
+# ---- Exit nodes and upstreams ---------------------------------------------
+exit_subnet="${EXIT_SUBNET:-10.10.11.0/24}"
+exit_subnet6="${EXIT_SUBNET6:-fda9:4efe:7e3b:03eb::/64}"
+exit_port_base="${EXIT_PORT_BASE:-}"
+upstreams_dir="${UPSTREAMS_DIR:-/etc/wireguard/upstreams}"
+upstream_handshake_timeout="${UPSTREAM_HANDSHAKE_TIMEOUT:-180}"
+
+# ---- Sidecar role ----------------------------------------------------------
+local_gateway="${LOCAL_GATEWAY:-direct}"
+local_gateway_rule_prio="${LOCAL_GATEWAY_RULE_PRIO:-1100}"
+forward_from="${FORWARD_FROM:-}"
+forward_from6="${FORWARD_FROM6:-}"
+gateway_nat6="$(to_bool "${GATEWAY_NAT6:-true}")"
+network="${NETWORK:-}"
+network6="${NETWORK6:-}"
+dns="${DNS:-1.1.1.1,1.0.0.1}"
+gateway_dns="${GATEWAY_DNS:-off}"
+gateway_dns_server="${GATEWAY_DNS_SERVER:-}"
+
+# ---- Health monitor ----------------------------------------------------------
+health_check_enabled="$(to_bool "${HEALTH_CHECK_ENABLED:-}")"
+health_check_egress="${HEALTH_CHECK_EGRESS:-}"
+health_check_url="${HEALTH_CHECK_URL:-https://1.1.1.1/cdn-cgi/trace}"
+
+# fwmark every WireGuard socket carries, so the encrypted UDP itself is
+# never policy-routed into a tunnel (wg-quick's own mechanism, explicit here)
+wg_fwmark="${WG_FWMARK:-0xca6c}"
+
+# Normalise the subnet-default gateway values (unmapped peers). Each family
+# accepts an IP/DNS name, "direct" (exit via the container's default route),
+# "block" ("drop" is an alias) or wg:<name> (an exit node / upstream):
+#   VPN_GATEWAY (v4):  "direct" and unset both mean ISP -> "";  result "", "block", IP, wg:<n>
+#   VPN_GATEWAY6 (v6): unset means "block" (no IPv6 leak);      result "", "direct", "block", IP, wg:<n>
+case "$vpn_gateway" in
+    direct) vpn_gateway="" ;;
+    drop)   vpn_gateway="block" ;;
+esac
+case "$vpn_gateway6" in
+    drop) vpn_gateway6="block" ;;
+esac
+case "$local_gateway" in
+    ""|direct) local_gateway="direct" ;;
+esac
+
+# ---- Paths -------------------------------------------------------------------
+config_dir="/etc/wireguard"
+server_dir="$config_dir/server"
+peers_dir="$config_dir/peers"
+wg_if="wg0"
+state_dir="/run/wireguard"
+vpngw_state_dir="$state_dir/vpngw"
+wg_conf="$state_dir/$wg_if.conf"
+peers_state="$state_dir/peers.def"       # normalized peer definitions (one "name k=v..." per line)
+peers_applied="$state_dir/peers.applied" # what is currently installed (same format)
+wg_lock="$state_dir/wg.lock"
+has_ipv6_file="$state_dir/has-ipv6"
+
+# Logging functions
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1"
+}
+
+log_error() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >&2
+}
+
+# Strip leading/trailing whitespace
+trim() {
+    _t="$1"
+    _t="${_t#"${_t%%[![:space:]]*}"}"
+    _t="${_t%"${_t##*[![:space:]]}"}"
+    printf '%s' "$_t"
+}
+
+# Turn "a;b,c" lists into newline-separated entries
+split_list() {
+    printf '%s\n' "${1:-}" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d'
+}
+
+# Build "{ elem, elem }" nft literal from newline-separated input, empty on no input
+nft_set_literal() {
+    _elems="$(sed '/^$/d' | paste -sd, - | sed 's/,/, /g')"
+    [ -n "$_elems" ] && printf '{ %s }' "$_elems"
+}
+
+# Print "key value" lines from a "key=value,key=value" list
+kv_pairs() {
+    [ -n "${1:-}" ] || return 0
+    echo "$1" | tr ',' '\n' | \
+        awk -F= '{ gsub(/[[:space:]]/, "") } $1 != "" && $2 != "" { print $1 " " $2 }'
+}
+
+# Parse "key value" / "key=value" lines from a file. Blank lines and
+# #-comments ignored; surrounding whitespace trimmed. Emits "key value".
+kv_file_pairs() {
+    [ -f "$1" ] || return 0
+    sed 's/#.*//' "$1" | awk '
+        { sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
+        $0 == "" { next }
+        { gsub(/=/, " "); if ($1 != "" && $2 != "") print $1 " " $2 }'
+}
+
+# Merge an env "k=v,k=v" list ($1) with a "k v"/"k=v" file ($2, optional) and
+# emit sorted "k value" lines, one per key. On a duplicate key the file wins.
+kv_merge_env_file() {
+    { kv_pairs "$1"; [ -n "$2" ] && kv_file_pairs "$2"; } \
+        | awk '$1 != "" { m[$1] = $2 } END { for (k in m) print k, m[k] }' \
+        | sort
+}
+
+# ---- Address helpers ---------------------------------------------------------
+
+# True when $1 is a literal IPv4 address.
+is_ipv4() {
+    case "$1" in
+        *[!0-9.]*) return 1 ;;
+        *.*.*.*)   return 0 ;;
+        *)         return 1 ;;
+    esac
+}
+
+# True when $1 is a literal IPv6 address (has a colon, only hex/colon/dot).
+is_ipv6() {
+    case "$1" in
+        *:*) case "$1" in *[!0-9A-Fa-f:.]*) return 1 ;; *) return 0 ;; esac ;;
+        *)   return 1 ;;
+    esac
+}
+
+is_cidr4() { # a.b.c.d/N
+    case "$1" in
+        */*) is_ipv4 "${1%/*}" || return 1
+             case "${1#*/}" in ''|*[!0-9]*) return 1 ;; esac
+             [ "${1#*/}" -le 32 ] ;;
+        *)   return 1 ;;
+    esac
+}
+
+is_cidr6() {
+    case "$1" in
+        */*) is_ipv6 "${1%/*}" || return 1
+             case "${1#*/}" in ''|*[!0-9]*) return 1 ;; esac
+             [ "${1#*/}" -le 128 ] ;;
+        *)   return 1 ;;
+    esac
+}
+
+is_number() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+ip4_to_int() { # a.b.c.d -> integer
+    echo "$1" | awk -F. '{ printf "%d\n", ($1 * 16777216) + ($2 * 65536) + ($3 * 256) + $4 }'
+}
+
+int_to_ip4() { # integer -> a.b.c.d
+    awk -v n="$1" 'BEGIN { printf "%d.%d.%d.%d\n", int(n / 16777216) % 256, int(n / 65536) % 256, int(n / 256) % 256, n % 256 }'
+}
+
+# Network/first-host/last-host of an IPv4 CIDR as integers: prints "net first last size"
+cidr4_range() {
+    _c_ip="${1%/*}"; _c_len="${1#*/}"
+    awk -v ip="$(ip4_to_int "$_c_ip")" -v len="$_c_len" 'BEGIN {
+        size = 2 ^ (32 - len)
+        net = int(ip / size) * size
+        if (len >= 31) { first = net; last = net + size - 1 }
+        else { first = net + 1; last = net + size - 2 }
+        printf "%d %d %d %d\n", net, first, last, size }'
+}
+
+# True when IPv4 $1 lies inside CIDR $2
+ip4_in_cidr() {
+    set -- "$(ip4_to_int "$1")" "$(cidr4_range "$2")"
+    _r_net="${2%% *}"; _r_rest="${2#* }"; _r_rest="${_r_rest#* }"; _r_last="${_r_rest%% *}"
+    [ "$1" -ge "$_r_net" ] && [ "$1" -le "$_r_last" ]
+}
+
+# The IPv6 prefix text of "<prefix>::/N" (everything before the trailing "::")
+ip6_prefix_text() {
+    case "${1%/*}" in
+        *::) printf '%s\n' "${1%/*}" ;;
+        *)   return 1 ;;
+    esac
+}
+
+# Compose "<prefix>::<hex index>" from a "<prefix>::/N" subnet and an index
+ip6_from_index() {
+    _p6="$(ip6_prefix_text "$1")" || return 1
+    printf '%s%x\n' "$_p6" "$2"
+}
+
+# ---- Gateway address resolution (DNS names) -------------------------------
+
+# True when $1 needs no DNS resolution: a reserved keyword, empty, literal IP,
+# an interface reference (dev:<if>) or wg:<name>.
+gw_is_literal() {
+    case "$1" in
+        ""|block|drop|direct|none|dev:*|wg:*|wg) return 0 ;;
+    esac
+    is_ipv4 "$1" && return 0
+    is_ipv6 "$1" && return 0
+    return 1
+}
+
+# The resolvers Docker configured before we rewrote resolv.conf (sidecar
+# mode). Saved by init-env; used to resolve endpoint hostnames, which must
+# work before (and independently of) any tunnel.
+bootstrap_nameservers() {
+    [ -f "$state_dir/resolv.conf.orig" ] || return 0
+    awk '/^nameserver/ { print $2 }' "$state_dir/resolv.conf.orig"
+}
+
+# Resolve a DNS name to all addresses of a family, one per line, deduped.
+# /etc/hosts first (--add-host, LAN setups), then - in sidecar mode - the
+# bootstrap resolvers, then the system resolver (getent).
+#   $1 = -4|-6   $2 = name
+gw_resolve_all() {
+    if [ "$1" = "-6" ]; then _pat='^[0-9a-fA-F:]+$'; _rr=AAAA; _db=ahostsv6; else _pat='^([0-9]{1,3}\.){3}[0-9]{1,3}$'; _rr=A; _db=ahostsv4; fi
+    _st="$(awk -v h="$2" '$1 !~ /^#/ { for (i = 2; i <= NF; i++) if ($i == h) print $1 }' /etc/hosts 2>/dev/null | grep -E "$_pat" || true)"
+    if [ -n "$_st" ]; then printf '%s\n' "$_st" | awk '!seen[$1]++'; return 0; fi
+    for _ns in $(bootstrap_nameservers); do
+        _r="$(dig +short +time=2 +tries=1 "@$_ns" "$_rr" "$2" 2>/dev/null | grep -E "$_pat" || true)"
+        if [ -n "$_r" ]; then printf '%s\n' "$_r" | awk '!seen[$1]++'; return 0; fi
+    done
+    getent "$_db" "$2" 2>/dev/null | awk '!seen[$1]++ { print $1 }'
+}
+
+# Resolve a DNS name to a single address (the first); prints it or returns 1.
+gw_resolve_one() {
+    _one="$(gw_resolve_all "$1" "$2" | head -1)"
+    [ -n "$_one" ] || return 1
+    printf '%s\n' "$_one"
+}
+
+# Pick a stable next-hop for a family: keep the current address ($3) if it is
+# still one of the name's resolved addresses; otherwise take the first.
+gw_resolve_stable() {
+    _all="$(gw_resolve_all "$1" "$2")"
+    [ -n "$_all" ] || return 1
+    if printf '%s\n' "$_all" | grep -qxF "$3"; then
+        printf '%s\n' "$3"
+    else
+        printf '%s\n' "$_all" | head -1
+    fi
+}
+
+# IPv6 usable in this container (decided once by init-env)
+ipv6_available() {
+    [ "$(cat "$has_ipv6_file" 2>/dev/null)" = "1" ]
+}
+
+# True when the IPv6 peer subnet is actually routed somewhere (NAT66 or a
+# gateway that carries IPv6). Otherwise peers get no IPv6 address at all -
+# handing out an address with no route only blackholes their IPv6.
+ipv6_routed() {
+    ipv6_available || return 1
+    [ "$ipv6_nat" = "1" ] && return 0
+    case "$vpn_gateway6" in ""|block|direct) ;; *) return 0 ;; esac
+    [ -n "$vpn_gateways6" ] && return 0
+    return 1
+}
+
+# ---- Peer model ----------------------------------------------------------------
+# A peer (node) is one line: "name [opt=value ...]". Sources: PEERS (env:
+# "alice,bob=<pubkey>") and PEERS_FILE; the file wins on a name. Every option
+# is optional - a bare name is a complete node. peers_normalize() fills the
+# defaults, generates keys, allocates addresses (persisting both on the
+# volume) and writes one fully-populated record per peer to $peers_state:
+#   name key=<pub> psk=<psk|off> ip=<v4> ip6=<v6|-> allowed=<c+c|-> gw=<g|->
+#        bypass=<p+p|none|-> dns=<l> routes=<l> keepalive=<n> enabled=<bool>
+#        exit=<bool> endpoint=<h:p|-> port=<n|-> lip=<v4|-> lip6=<v6|-> lkey=<pub|->
+# (lip/lip6/lkey/port: the exit node's local side - our interface address and
+# key, and the dial-in listen port.)
+
+peer_known_opts=" key psk ip ip6 allowed gw bypass dns routes keepalive enabled exit endpoint port "
+
+# Value of option $2 in record/line $1 (empty when absent)
+peer_opt() {
+    printf '%s\n' "$1" | awk -v k="$2" '{ for (i = 2; i <= NF; i++) if (index($i, k "=") == 1) { print substr($i, length(k) + 2); exit } }'
+}
+
+peer_name_of() { printf '%s\n' "${1%% *}"; }
+
+# Look a peer record up by name in a state file ($2, default $peers_state)
+peer_record() {
+    awk -v n="$1" '$1 == n { print; exit }' "${2:-$peers_state}" 2>/dev/null
+}
+
+peer_name_valid() {
+    case "$1" in
+        ""|direct|block|drop|none|all|default|main) return 1 ;;
+        -*|*[!a-zA-Z0-9_-]*) return 1 ;;
+    esac
+    return 0
+}
+
+# WireGuard keys are 32 bytes base64: 44 chars ending in "="
+is_wg_key() {
+    case "$1" in
+        *[!A-Za-z0-9+/=]*) return 1 ;;
+    esac
+    [ "${#1}" -eq 44 ] || return 1
+    case "$1" in *=) return 0 ;; *) return 1 ;; esac
+}
+
+# Raw merged definitions: env entries first, then the file (file wins per name).
+# Output: "name opt=value ..." one per line, comments/blank lines stripped.
+peers_raw() {
+    {
+        if [ -n "$peers" ]; then
+            printf '%s\n' "$peers" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d' \
+                | while IFS= read -r _tok; do
+                    case "$_tok" in
+                        *=*) printf '%s key=%s\n' "${_tok%%=*}" "${_tok#*=}" ;;
+                        *)   printf '%s\n' "$_tok" ;;
+                    esac
+                done
+        fi
+        if [ -n "$peers_file" ] && [ -f "$peers_file" ]; then
+            sed 's/[[:space:]]#.*//; s/^#.*//' "$peers_file" | awk '
+                { sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
+                $0 == "" { next }
+                { $1 = $1; print }'
+        fi
+    } | awk '{ if (!($1 in seen)) order[++n] = $1; seen[$1] = 1; rec[$1] = $0 }
+             END { for (i = 1; i <= n; i++) print rec[order[i]] }'
+}
+
+# Persisted per-peer files
+peer_dir() { printf '%s/%s\n' "$peers_dir" "$1"; }
+
+peer_keys_ensure() { # $1 = name, $2 = pubkey|auto, $3 = psk option -> sets PK_PUB PK_PSK
+    _d="$(peer_dir "$1")"
+    mkdir -p "$_d"
+    if [ "$2" = "auto" ]; then
+        if [ ! -s "$_d/privatekey" ]; then
+            (umask 077; wg genkey > "$_d/privatekey") || return 1
+            rm -f "$_d/publickey"
+            log "[PEERS] Generated keypair for '$1'"
+        fi
+        if [ ! -s "$_d/publickey" ]; then
+            wg pubkey < "$_d/privatekey" > "$_d/publickey" || return 1
+        fi
+        PK_PUB="$(cat "$_d/publickey")"
+    else
+        # Device-made key: record the public key only; drop any generated
+        # private key so the config never carries a stale one.
+        if [ -s "$_d/privatekey" ]; then
+            log "[PEERS] '$1' now uses a device-made key; removing the generated private key"
+            rm -f "$_d/privatekey"
+        fi
+        printf '%s\n' "$2" > "$_d/publickey"
+        PK_PUB="$2"
+    fi
+    case "$3" in
+        off) PK_PSK="off" ;;
+        auto)
+            if [ ! -s "$_d/presharedkey" ]; then
+                (umask 077; wg genpsk > "$_d/presharedkey") || return 1
+            fi
+            PK_PSK="$(cat "$_d/presharedkey")"
+            ;;
+        *)  (umask 077; printf '%s\n' "$3" > "$_d/presharedkey"); PK_PSK="$3" ;;
+    esac
+    return 0
+}
+
+# Local (our side) keypair of an exit node -> sets PK_LPUB
+exit_local_keys_ensure() {
+    _d="$(peer_dir "$1")"
+    mkdir -p "$_d"
+    if [ ! -s "$_d/local.privatekey" ]; then
+        (umask 077; wg genkey > "$_d/local.privatekey") || return 1
+        rm -f "$_d/local.publickey"
+    fi
+    [ -s "$_d/local.publickey" ] || wg pubkey < "$_d/local.privatekey" > "$_d/local.publickey" || return 1
+    PK_LPUB="$(cat "$_d/local.publickey")"
+}
+
+# ---- Address allocation --------------------------------------------------------
+# Persisted in <peer dir>/address ("v4 [v6pin]") and, for exit nodes, in
+# <peer dir>/local.address (our side). Allocation is "lowest free host of the
+# subnet", skipping the server address, every persisted address (also those of
+# peers no longer defined, so nobody is ever renumbered) and every pinned one.
+# IPv6 is derived from the IPv4 host offset (<prefix>::<offset>) unless pinned.
+
+alloc_used_v4() { # $1 = address file basename (address|local.address); prints used IPv4s
+    for _f in "$peers_dir"/*/"$1"; do
+        [ -f "$_f" ] && awk 'NF { print $1 }' "$_f"
+    done 2>/dev/null
+}
+
+# Lowest free host in CIDR $1 not listed in the newline list $2 (also skips the first host)
+alloc_next_v4() {
+    set -- "$1" "$2" "$(cidr4_range "$1")"
+    _an_first="${3#* }"; _an_first="${_an_first%% *}"
+    _an_last="${3#* * }"; _an_last="${_an_last%% *}"
+    _an_i=$((_an_first + 1))
+    while [ "$_an_i" -le "$_an_last" ]; do
+        _an_ip="$(int_to_ip4 "$_an_i")"
+        printf '%s\n' "$2" | grep -qxF "$_an_ip" || { printf '%s\n' "$_an_ip"; return 0; }
+        _an_i=$((_an_i + 1))
+    done
+    return 1
+}
+
+# IPv6 of a peer from its IPv4 (host offset inside $2) and subnet $3
+alloc_v6_for() { # $1 = v4, $2 = v4 subnet, $3 = v6 subnet
+    set -- "$(ip4_to_int "$1")" "$(cidr4_range "$2")" "$3"
+    _a6_net="${2%% *}"
+    ip6_from_index "$3" "$(($1 - _a6_net))"
+}
+
+# First host of a CIDR (the server's own address)
+cidr4_first_host() {
+    set -- "$(cidr4_range "$1")"
+    _fh="${1#* }"; int_to_ip4 "${_fh%% *}"
+}
+
+server_addr4() { cidr4_first_host "$vpn_subnet"; }
+server_addr6() { ip6_from_index "$ipv6_subnet" 1; }
+
+# ---- Normalisation -------------------------------------------------------------
+# Validate every raw definition, fill defaults, persist keys/addresses and
+# write $peers_state atomically. Returns 1 (state untouched) on any error, so
+# a bad edit never half-applies. Gateway/bypass references are validated by
+# the caller against the gateway state (peers_check_gateways).
+peers_normalize() {
+    _pn_tmp="$peers_state.new.$$"
+    : > "$_pn_tmp"
+    _pn_bad=0
+    _pn_used4="$(alloc_used_v4 address)"
+    _pn_lused4="$(alloc_used_v4 local.address)"
+    _pn_seen_names=""
+    _pn_used_ports="$(for _f in "$peers_dir"/*/port; do [ -f "$_f" ] && cat "$_f"; done 2>/dev/null)"
+
+    # First pass: syntax + pinned addresses (so an unpinned peer never grabs a
+    # pin that appears later in the file)
+    _pn_raw="$(peers_raw)"
+    _pn_pins4="$(printf '%s\n' "$_pn_raw" | while IFS= read -r _l; do peer_opt "$_l" ip; done | sed '/^$/d')"
+    _pn_used4="$(printf '%s\n%s\n' "$_pn_used4" "$_pn_pins4" | sed '/^$/d')"
+
+    printf '%s\n' "$_pn_raw" | while IFS= read -r _line; do
+        [ -n "$_line" ] || continue
+        _name="$(peer_name_of "$_line")"
+        if ! peer_name_valid "$_name"; then
+            log_error "[PEERS] invalid peer name '$_name' (letters, digits, _ and -; must not start with -; reserved words excluded)"
+            echo BAD >> "$_pn_tmp.bad"; continue
+        fi
+        for _tok in $_line; do
+            [ "$_tok" = "$_name" ] && continue
+            case "$_tok" in
+                *=*) _k="${_tok%%=*}" ;;
+                *)   _k="$_tok" ;;
+            esac
+            case "$peer_known_opts" in
+                *" $_k "*) ;;
+                *) log_error "[PEERS] peer '$_name': unknown option '$_tok'"; echo BAD >> "$_pn_tmp.bad"; continue 2 ;;
+            esac
+        done
+        _key="$(peer_opt "$_line" key)";       _key="${_key:-auto}"
+        _psk="$(peer_opt "$_line" psk)";       _psk="${_psk:-auto}"
+        _ip="$(peer_opt "$_line" ip)"
+        _ip6="$(peer_opt "$_line" ip6)"
+        _allowed="$(peer_opt "$_line" allowed)"
+        _gw="$(peer_opt "$_line" gw)"
+        _bypass="$(peer_opt "$_line" bypass)"
+        _dns="$(peer_opt "$_line" dns)";       _dns="${_dns:-$(printf '%s' "$peer_dns" | tr ',;' '++')}"
+        _routes="$(peer_opt "$_line" routes)"; _routes="${_routes:-$(printf '%s' "$peer_routes" | tr ',;' '++')}"
+        _ka="$(peer_opt "$_line" keepalive)";  _ka="${_ka:-$peer_keepalive}"
+        _en="$(to_bool "$(peer_opt "$_line" enabled)")"; [ -z "$(peer_opt "$_line" enabled)" ] && _en=true
+        _exit="$(to_bool "$(peer_opt "$_line" exit)")"
+        _endpoint="$(peer_opt "$_line" endpoint)"
+        _port="$(peer_opt "$_line" port)"
+
+        if [ "$_key" != "auto" ] && ! is_wg_key "$_key"; then
+            log_error "[PEERS] peer '$_name': key must be 'auto' or a 44-character WireGuard public key"; echo BAD >> "$_pn_tmp.bad"; continue
+        fi
+        case "$_psk" in auto|off) ;; *) is_wg_key "$_psk" || { log_error "[PEERS] peer '$_name': psk must be auto, off or a WireGuard pre-shared key"; echo BAD >> "$_pn_tmp.bad"; continue; } ;; esac
+        is_number "$_ka" || { log_error "[PEERS] peer '$_name': keepalive must be a number of seconds"; echo BAD >> "$_pn_tmp.bad"; continue; }
+        case "$_gw" in
+            ""|direct|block) ;;
+            drop) _gw=block ;;
+            *) peer_name_valid "$_gw" || { log_error "[PEERS] peer '$_name': invalid gateway name '$_gw'"; echo BAD >> "$_pn_tmp.bad"; continue; } ;;
+        esac
+        if [ "$_exit" = "true" ]; then
+            [ "${#_name}" -le 12 ] || { log_error "[PEERS] exit node '$_name': name must be at most 12 characters (interface wg-$_name)"; echo BAD >> "$_pn_tmp.bad"; continue; }
+            [ -z "$_gw$_bypass$_allowed" ] || { log_error "[PEERS] exit node '$_name': gw=, bypass= and allowed= do not apply to an exit node"; echo BAD >> "$_pn_tmp.bad"; continue; }
+            if [ -n "$_endpoint" ]; then
+                case "$_endpoint" in
+                    *:*) is_number "${_endpoint##*:}" || { log_error "[PEERS] exit node '$_name': endpoint must be host:port"; echo BAD >> "$_pn_tmp.bad"; continue; } ;;
+                    *)   log_error "[PEERS] exit node '$_name': endpoint must be host:port"; echo BAD >> "$_pn_tmp.bad"; continue ;;
+                esac
+                [ -z "$_port" ] || { log_error "[PEERS] exit node '$_name': port= (dial-in) and endpoint= (dial-out) are mutually exclusive"; echo BAD >> "$_pn_tmp.bad"; continue; }
+            fi
+            [ -z "$_port" ] || is_number "$_port" || { log_error "[PEERS] exit node '$_name': port must be a number"; echo BAD >> "$_pn_tmp.bad"; continue; }
+            _sub4="$exit_subnet"; _sub6="$exit_subnet6"; _afile="address"
+        else
+            [ -z "$_endpoint$_port" ] || { log_error "[PEERS] peer '$_name': endpoint= and port= apply to exit nodes only (exit=true)"; echo BAD >> "$_pn_tmp.bad"; continue; }
+            _sub4="$vpn_subnet"; _sub6="$ipv6_subnet"; _afile="address"
+        fi
+
+        # Keys
+        peer_keys_ensure "$_name" "$_key" "$_psk" || { log_error "[PEERS] peer '$_name': key generation failed"; echo BAD >> "$_pn_tmp.bad"; continue; }
+        _key="$PK_PUB"; _psk="$PK_PSK"
+
+        # Addresses (the node's own)
+        _d="$(peer_dir "$_name")"
+        _persisted="$(awk 'NF { print $1; exit }' "$_d/$_afile" 2>/dev/null)"
+        _persisted6="$(awk 'NF >= 2 { print $2; exit }' "$_d/$_afile" 2>/dev/null)"
+        if [ -n "$_ip" ]; then
+            is_ipv4 "$_ip" || { log_error "[PEERS] peer '$_name': ip must be an IPv4 address"; echo BAD >> "$_pn_tmp.bad"; continue; }
+            ip4_in_cidr "$_ip" "$_sub4" || { log_error "[PEERS] peer '$_name': ip $_ip is outside $_sub4"; echo BAD >> "$_pn_tmp.bad"; continue; }
+            [ "$_ip" != "$(cidr4_first_host "$_sub4")" ] || { log_error "[PEERS] peer '$_name': ip $_ip is the server's own address"; echo BAD >> "$_pn_tmp.bad"; continue; }
+            # A pin must not collide with another peer's persisted address
+            _owner=""
+            for _of in "$peers_dir"/*/"$_afile"; do
+                [ -f "$_of" ] || continue
+                _on="${_of%/*}"; _on="${_on##*/}"
+                [ "$_on" = "$_name" ] && continue
+                awk -v ip="$_ip" '$1 == ip { f = 1 } END { exit !f }' "$_of" && { _owner="$_on"; break; }
+            done
+            [ -z "$_owner" ] || { log_error "[PEERS] peer '$_name': ip $_ip is already assigned to '$_owner'"; echo BAD >> "$_pn_tmp.bad"; continue; }
+        elif [ -n "$_persisted" ] && ip4_in_cidr "$_persisted" "$_sub4"; then
+            _ip="$_persisted"
+        else
+            _ip="$(alloc_next_v4 "$_sub4" "$_pn_used4")" || { log_error "[PEERS] peer '$_name': no free address left in $_sub4"; echo BAD >> "$_pn_tmp.bad"; continue; }
+            _pn_used4="$(printf '%s\n%s\n' "$_pn_used4" "$_ip")"
+            log "[PEERS] Assigned $_ip to '$_name'"
+        fi
+        if [ -n "$_ip6" ]; then
+            is_ipv6 "$_ip6" || { log_error "[PEERS] peer '$_name': ip6 must be an IPv6 address"; echo BAD >> "$_pn_tmp.bad"; continue; }
+        elif [ -n "$_persisted6" ]; then
+            _ip6="$_persisted6"
+        else
+            _ip6="$(alloc_v6_for "$_ip" "$_sub4" "$_sub6" 2>/dev/null)" || _ip6=""
+        fi
+        if [ "$_ip $_ip6" != "$_persisted $_persisted6" ]; then
+            mkdir -p "$_d"
+            if [ -n "$(peer_opt "$_line" ip6)" ]; then printf '%s %s\n' "$_ip" "$_ip6" > "$_d/$_afile"; else printf '%s\n' "$_ip" > "$_d/$_afile"; fi
+        fi
+        [ -n "$_ip6" ] || _ip6="-"
+
+        # Exit node: our side of the transfer link and the listen port
+        _lip="-"; _lip6="-"; _lkey="-"
+        if [ "$_exit" = "true" ]; then
+            exit_local_keys_ensure "$_name" || { log_error "[PEERS] exit node '$_name': local key generation failed"; echo BAD >> "$_pn_tmp.bad"; continue; }
+            _lkey="$PK_LPUB"
+            _lip="$(awk 'NF { print $1; exit }' "$_d/local.address" 2>/dev/null)"
+            if [ -z "$_lip" ] || ! ip4_in_cidr "$_lip" "$exit_subnet"; then
+                _lip="$(alloc_next_v4 "$exit_subnet" "$(printf '%s\n%s\n' "$_pn_used4" "$_pn_lused4")")" || { log_error "[PEERS] exit node '$_name': no free address left in $exit_subnet"; echo BAD >> "$_pn_tmp.bad"; continue; }
+                _pn_lused4="$(printf '%s\n%s\n' "$_pn_lused4" "$_lip")"
+                printf '%s\n' "$_lip" > "$_d/local.address"
+            fi
+            _lip6="$(alloc_v6_for "$_lip" "$exit_subnet" "$exit_subnet6" 2>/dev/null)" || _lip6="-"
+            if [ -z "$_endpoint" ]; then
+                _pport="$(cat "$_d/port" 2>/dev/null)"
+                if [ -n "$_port" ]; then
+                    :
+                elif [ -n "$_pport" ]; then
+                    _port="$_pport"
+                else
+                    _port="${exit_port_base:-$((listen_port + 1))}"
+                    while printf '%s\n' "$_pn_used_ports" | grep -qx "$_port" || [ "$_port" = "$listen_port" ]; do
+                        _port=$((_port + 1))
+                    done
+                    _pn_used_ports="$(printf '%s\n%s\n' "$_pn_used_ports" "$_port")"
+                    log "[PEERS] Exit node '$_name' listens on UDP $_port (publish it)"
+                fi
+                [ "$_port" = "$_pport" ] || printf '%s\n' "$_port" > "$_d/port"
+                _endpoint="-"
+            else
+                _port="-"
+            fi
+        else
+            _endpoint="-"; _port="-"
+        fi
+
+        printf '%s key=%s psk=%s ip=%s ip6=%s allowed=%s gw=%s bypass=%s dns=%s routes=%s keepalive=%s enabled=%s exit=%s endpoint=%s port=%s lip=%s lip6=%s lkey=%s\n' \
+            "$_name" "$_key" "$_psk" "$_ip" "$_ip6" "${_allowed:--}" "${_gw:--}" "${_bypass:--}" \
+            "$_dns" "$_routes" "$_ka" "$_en" "$_exit" "$_endpoint" "$_port" "$_lip" "$_lip6" "$_lkey" >> "$_pn_tmp"
+    done
+
+    if [ -f "$_pn_tmp.bad" ]; then
+        rm -f "$_pn_tmp" "$_pn_tmp.bad"
+        return 1
+    fi
+    # Duplicate public keys would make wg merge two peers into one
+    _dup="$(awk '{ for (i = 2; i <= NF; i++) if (index($i, "key=") == 1) print substr($i, 5) }' "$_pn_tmp" | sort | uniq -d | head -1)"
+    if [ -n "$_dup" ]; then
+        log_error "[PEERS] two peers share the public key $_dup"
+        rm -f "$_pn_tmp"
+        return 1
+    fi
+    mv "$_pn_tmp" "$peers_state"
+    return 0
+}
+
+# Validate gw= references against the gateway state ($vpngw_state_dir/gateways,
+# "name table gw4 gw6" lines; exit nodes and upstreams are registered there
+# too). Returns 1 on an unknown gateway.
+peers_check_gateways() {
+    _pc_bad=0
+    while IFS= read -r _rec; do
+        [ -n "$_rec" ] || continue
+        _g="$(peer_opt "$_rec" gw)"
+        case "$_g" in
+            -|direct|block) continue ;;
+        esac
+        if ! awk -v n="$_g" '$1 == n { f = 1 } END { exit !f }' "$vpngw_state_dir/gateways" 2>/dev/null; then
+            log_error "[PEERS] peer '$(peer_name_of "$_rec")': unknown gateway '$_g' (define it in VPN_GATEWAYS, as an exit node, or as an upstream conf)"
+            _pc_bad=1
+        fi
+    done < "${1:-$peers_state}"
+    return "$_pc_bad"
+}
+
+# ---- Config generation ---------------------------------------------------------
+
+server_keys_ensure() {
+    mkdir -p "$server_dir"
+    if [ ! -s "$server_dir/privatekey" ]; then
+        (umask 077; wg genkey > "$server_dir/privatekey") || return 1
+        rm -f "$server_dir/publickey"
+        log "[INIT-ENV] Generated server keypair"
+    fi
+    [ -s "$server_dir/publickey" ] || wg pubkey < "$server_dir/privatekey" > "$server_dir/publickey"
+}
+
+server_pubkey() { cat "$server_dir/publickey"; }
+
+# host:port the devices dial. $1 = port. Falls back to a visible placeholder.
+server_endpoint_for() {
+    _se="$server_endpoint"
+    if [ -z "$_se" ]; then
+        printf '<SERVER_ENDPOINT>:%s\n' "$1"
+        return 0
+    fi
+    case "$_se" in
+        \[*\]:*) printf '%s\n' "$_se" ;;            # [v6]:port
+        \[*\])   printf '%s:%s\n' "$_se" "$1" ;;    # [v6]
+        *:*:*)   printf '[%s]:%s\n' "$_se" "$1" ;;  # bare v6
+        *:*)     printf '%s\n' "$_se" ;;            # host:port
+        *)       printf '%s:%s\n' "$_se" "$1" ;;
+    esac
+}
+
+# "a+b+c" -> "a, b, c"
+plus_list() { printf '%s' "$1" | sed 's/+/, /g'; }
+
+# The wg0 interface config (wg setconf format: no Address/MTU/DNS here)
+wg_conf_build() {
+    _wc_tmp="$wg_conf.new.$$"
+    {
+        echo "[Interface]"
+        echo "PrivateKey = $(cat "$server_dir/privatekey")"
+        echo "ListenPort = $listen_port"
+        echo "FwMark = $wg_fwmark"
+        while IFS= read -r _rec; do
+            [ -n "$_rec" ] || continue
+            [ "$(peer_opt "$_rec" exit)" = "true" ] && continue
+            [ "$(peer_opt "$_rec" enabled)" = "true" ] || continue
+            _ips="$(peer_opt "$_rec" ip)/32"
+            _v6="$(peer_opt "$_rec" ip6)"
+            [ "$_v6" != "-" ] && ipv6_routed && _ips="$_ips, $_v6/128"
+            _al="$(peer_opt "$_rec" allowed)"
+            [ "$_al" != "-" ] && _ips="$_ips, $(plus_list "$_al")"
+            echo
+            echo "# $(peer_name_of "$_rec")"
+            echo "[Peer]"
+            echo "PublicKey = $(peer_opt "$_rec" key)"
+            _p="$(peer_opt "$_rec" psk)"
+            [ "$_p" != "off" ] && echo "PresharedKey = $_p"
+            echo "AllowedIPs = $_ips"
+        done < "$peers_state"
+    } > "$_wc_tmp" && chmod 600 "$_wc_tmp" && mv "$_wc_tmp" "$wg_conf"
+}
+
+# Interface config of an exit node (our side). $1 = record
+exit_conf_build() {
+    _name="$(peer_name_of "$1")"
+    _ec_out="$state_dir/wg-$_name.conf"
+    _ec_ep="$(peer_opt "$1" endpoint)"
+    _ec_port="$(peer_opt "$1" port)"
+    _ec_allowed="0.0.0.0/0"
+    ipv6_routed && _ec_allowed="$_ec_allowed, ::/0"
+    {
+        echo "[Interface]"
+        echo "PrivateKey = $(cat "$(peer_dir "$_name")/local.privatekey")"
+        [ "$_ec_port" != "-" ] && echo "ListenPort = $_ec_port"
+        echo "FwMark = $wg_fwmark"
+        echo
+        echo "[Peer]"
+        echo "PublicKey = $(peer_opt "$1" key)"
+        _p="$(peer_opt "$1" psk)"
+        [ "$_p" != "off" ] && echo "PresharedKey = $_p"
+        echo "AllowedIPs = $_ec_allowed"
+        if [ "$_ec_ep" != "-" ]; then
+            echo "Endpoint = $_ec_ep"
+            echo "PersistentKeepalive = $(peer_opt "$1" keepalive)"
+        fi
+    } > "$_ec_out.new.$$" && chmod 600 "$_ec_out.new.$$" && mv "$_ec_out.new.$$" "$_ec_out"
+}
+
+# The config a device imports. $1 = record. Prints to stdout.
+peer_client_conf() {
+    _name="$(peer_name_of "$1")"
+    _d="$(peer_dir "$_name")"
+    if [ -s "$_d/privatekey" ]; then
+        _priv="$(cat "$_d/privatekey")"
+    else
+        _priv="<PRIVATE KEY OF THIS DEVICE - generated on the device, matches key=$(peer_opt "$1" key)>"
+    fi
+    _p="$(peer_opt "$1" psk)"
+    _v6="$(peer_opt "$1" ip6)"
+    if [ "$(peer_opt "$1" exit)" = "true" ]; then
+        _lip="$(peer_opt "$1" lip)"; _lip6="$(peer_opt "$1" lip6)"
+        _ep="$(peer_opt "$1" endpoint)"; _port="$(peer_opt "$1" port)"
+        _addr="$(peer_opt "$1" ip)/32"
+        _allowed="$_lip/32"
+        if [ "$_v6" != "-" ] && [ "$_lip6" != "-" ] && ipv6_routed; then
+            _addr="$_addr, $_v6/128"; _allowed="$_allowed, $_lip6/128"
+        fi
+        echo "# Exit node '$_name' - import this on the exit device. It must NAT traffic"
+        echo "# arriving from $_lip out its own uplink, e.g. (Linux, replace eth0):"
+        echo "#   iptables -t nat -A POSTROUTING -s $_lip/32 -o eth0 -j MASQUERADE"
+        echo "#   sysctl -w net.ipv4.ip_forward=1"
+        echo "[Interface]"
+        echo "PrivateKey = $_priv"
+        echo "Address = $_addr"
+        if [ "$_ep" != "-" ]; then
+            echo "ListenPort = ${_ep##*:}"
+        fi
+        echo
+        echo "[Peer]"
+        echo "PublicKey = $(peer_opt "$1" lkey)"
+        [ "$_p" != "off" ] && echo "PresharedKey = $_p"
+        echo "AllowedIPs = $_allowed"
+        if [ "$_ep" = "-" ]; then
+            echo "Endpoint = $(server_endpoint_for "$_port")"
+            echo "PersistentKeepalive = $(peer_opt "$1" keepalive)"
+        fi
+    else
+        _addr="$(peer_opt "$1" ip)/32"
+        [ "$_v6" != "-" ] && ipv6_routed && _addr="$_addr, $_v6/128"
+        echo "# Peer '$_name' - import this on the device (or scan: peer-conf $_name --qr)"
+        echo "[Interface]"
+        echo "PrivateKey = $_priv"
+        echo "Address = $_addr"
+        echo "DNS = $(plus_list "$(peer_opt "$1" dns)")"
+        echo
+        echo "[Peer]"
+        echo "PublicKey = $(server_pubkey)"
+        [ "$_p" != "off" ] && echo "PresharedKey = $_p"
+        echo "Endpoint = $(server_endpoint_for "$listen_port")"
+        echo "AllowedIPs = $(plus_list "$(peer_opt "$1" routes)")"
+        _ka="$(peer_opt "$1" keepalive)"
+        [ "$_ka" != "0" ] && echo "PersistentKeepalive = $_ka"
+    fi
+}
+
+# Write <name>.conf (+ .png QR) into the peer's directory; only when changed
+peer_client_conf_write() {
+    _name="$(peer_name_of "$1")"
+    _d="$(peer_dir "$_name")"
+    mkdir -p "$_d"
+    _new="$(peer_client_conf "$1")"
+    if [ -f "$_d/$_name.conf" ] && [ "$(cat "$_d/$_name.conf")" = "$_new" ]; then
+        return 0
+    fi
+    (umask 077; printf '%s\n' "$_new" > "$_d/$_name.conf")
+    if command -v qrencode >/dev/null 2>&1; then
+        printf '%s\n' "$_new" | grep -v '^#' | qrencode -o "$_d/$_name.png" 2>/dev/null \
+            || log_error "[PEERS] Warning: could not render QR code for '$_name'"
+    fi
+    return 0
+}
+
+# Regenerate every device config (idempotent, writes only on change)
+peers_write_client_confs() {
+    while IFS= read -r _rec; do
+        [ -n "$_rec" ] || continue
+        peer_client_conf_write "$_rec"
+    done < "$peers_state"
+}
+
+# ---- Gateway / routing state --------------------------------------------------
+# Written by init-vpngw in $vpngw_state_dir (tmpfs, rebuilt every boot):
+#   gateways      "name table gw4 gw6" - resolved next-hops per named gateway;
+#                 gw4/gw6 are an IP, "block", or "dev:<iface>" (exit node /
+#                 upstream: the routing table says "default dev <iface>")
+#   gateways.src  "name src4 src6" - the unresolved tokens (DNS names kept)
+#   subnet        "gw4 gw6" default for unmapped peers (IP, dev:<if>, block,
+#                 "-" = ISP, v6 also "direct")
+#   local         "gwname table" when LOCAL_GATEWAY steers local traffic
+#   applied/<n>   "gw addrs4 addrs6" per peer with installed rules ('+'-joined)
+
+gw_is_dev() { case "$1" in dev:*) return 0 ;; *) return 1 ;; esac; }
+gw_dev_of() { printf '%s\n' "${1#dev:}"; }
+
+# Parse the gateway definition file: "name ipv4 [ipv6]" per line.
+vpngw_gw_file_lines() {
+    [ -f "$1" ] || return 0
+    sed 's/#.*//' "$1" | awk '
+        { sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
+        $0 == "" { next }
+        { gsub(/=/, " "); if ($1 != "" && $2 != "") print $1, $2, $3 }'
+}
+
+# Merge VPN_GATEWAYS / VPN_GATEWAYS6 / VPN_GATEWAYS_FILE into sorted
+# "name tok4 tok6" lines (file wins per field). A missing IPv4 is "none", a
+# missing IPv6 is "block". "wg" is expanded to "wg:<name>".
+vpngw_gateways_merged() {
+    {
+        kv_pairs "$1" | awk '{ print "e4", $1, $2 }'
+        kv_pairs "$2" | awk '{ print "e6", $1, $2 }'
+        [ -n "$3" ] && vpngw_gw_file_lines "$3" | awk '{ print "f", $1, $2, $3 }'
+    } | awk '
+        function norm(n, x) { if (x == "block" || x == "drop") return "block"; if (x == "wg") return "wg:" n; return x }
+        $1 == "e4" { v4e[$2] = norm($2, $3) }
+        $1 == "e6" { v6e[$2] = norm($2, $3) }
+        $1 == "f"  { f4[$2] = norm($2, $3); if ($4 != "") f6[$2] = norm($2, $4) }
+        END {
+            for (n in v4e) names[n] = 1
+            for (n in v6e) names[n] = 1
+            for (n in f4)  names[n] = 1
+            for (n in names) {
+                ip4 = (n in f4 ? f4[n] : (n in v4e ? v4e[n] : "none"))
+                ip6 = (n in f6 ? f6[n] : (n in v6e ? v6e[n] : "block"))
+                print n, ip4, ip6
+            }
+        }' | sort
+}
+
+# Capability record of a WireGuard interface gateway, written by
+# init-upstreams: $state_dir/ifaces/<iface> = "v4 v6" (yes|no) - does the
+# tunnel carry that family?
+iface_routes_family() { # $1 = iface, $2 = 4|6
+    _ir="$(cat "$state_dir/ifaces/$1" 2>/dev/null)" || return 1
+    if [ "$2" = 4 ]; then [ "${_ir%% *}" = "yes" ]; else [ "${_ir##* }" = "yes" ]; fi
+}
+
+# Gateway line by name: "name table gw4 gw6"
+gw_line() { awk -v n="$1" '$1 == n { print; exit }' "$vpngw_state_dir/gateways" 2>/dev/null; }
+
+# Address lists (newline-separated CIDRs) of a peer record, per family.
+# Includes its own /32 (/128) and every allowed= network of that family.
+peer_cidrs4() {
+    printf '%s/32\n' "$(peer_opt "$1" ip)"
+    _al="$(peer_opt "$1" allowed)"
+    [ "$_al" != "-" ] && printf '%s\n' "$_al" | tr '+' '\n' | while read -r _c; do is_cidr4 "$_c" && printf '%s\n' "$_c"; done
+    return 0
+}
+peer_cidrs6() {
+    _v6="$(peer_opt "$1" ip6)"
+    [ "$_v6" != "-" ] && ipv6_routed && printf '%s/128\n' "$_v6"
+    _al="$(peer_opt "$1" allowed)"
+    [ "$_al" != "-" ] && printf '%s\n' "$_al" | tr '+' '\n' | while read -r _c; do is_cidr6 "$_c" && printf '%s\n' "$_c"; done
+    return 0
+}
+
+# Remove every policy rule and kill-switch entry for a set of addresses.
+# Idempotent. $1 = v4 CIDRs ('+'-joined, may be "-"), $2 = v6 CIDRs
+vpngw_cleanup_addrs() {
+    _prio="$vpn_gateway_peer_rule_prio"
+    for _c in $(printf '%s' "${1:--}" | tr '+' ' '); do
+        [ "$_c" = "-" ] && continue
+        _n=0
+        while [ "$_n" -lt 16 ] && ip rule del from "$_c" priority "$_prio" 2>/dev/null; do _n=$((_n + 1)); done
+        nft delete element inet wg_gw direct_v4 "{ $_c }" 2>/dev/null || true
+        nft delete element inet wg_gw v4_block "{ $_c }" 2>/dev/null || true
+        [ -f "$vpngw_state_dir/gateways" ] && while read -r _gn _ _ _; do
+            [ -n "$_gn" ] && { nft delete element inet wg_gw "gw_${_gn}_v4" "{ $_c }" 2>/dev/null || true; }
+        done < "$vpngw_state_dir/gateways"
+    done
+    for _c in $(printf '%s' "${2:--}" | tr '+' ' '); do
+        [ "$_c" = "-" ] && continue
+        _n=0
+        while [ "$_n" -lt 16 ] && ip -6 rule del from "$_c" priority "$_prio" 2>/dev/null; do _n=$((_n + 1)); done
+        nft delete element inet wg_gw direct_v6 "{ $_c }" 2>/dev/null || true
+        nft delete element inet wg_gw v6_block "{ $_c }" 2>/dev/null || true
+        [ -f "$vpngw_state_dir/gateways" ] && while read -r _gn _ _ _; do
+            [ -n "$_gn" ] && { nft delete element inet wg_gw "gw_${_gn}_v6" "{ $_c }" 2>/dev/null || true; }
+        done < "$vpngw_state_dir/gateways"
+    done
+    return 0
+}
+
+# Install the policy rules + kill-switch entries steering a set of addresses
+# to a gateway. $1 = label (peer name), $2 = gateway ("direct", "block" or a
+# name), $3 = v4 CIDRs ('+'), $4 = v6 CIDRs ('+', may be "-"). Returns 1 on
+# failure (caller cleans up). Does not exit.
+vpngw_apply_addrs() {
+    _u="$1"; _gw="$2"; _prio="$vpn_gateway_peer_rule_prio"
+    _c4="$(printf '%s' "${3:--}" | tr '+' ' ')"; [ "$_c4" = "-" ] && _c4=""
+    _c6="$(printf '%s' "${4:--}" | tr '+' ' ')"; [ "$_c6" = "-" ] && _c6=""
+    case "$_gw" in
+        direct)
+            for _c in $_c4; do
+                ip rule add from "$_c" lookup main priority "$_prio" || return 1
+                nft add element inet wg_gw direct_v4 "{ $_c }" || return 1
+            done
+            for _c in $_c6; do
+                ip -6 rule add from "$_c" lookup main priority "$_prio" || return 1
+                nft add element inet wg_gw direct_v6 "{ $_c }" || return 1
+            done
+            log "[VPNGW] '$_u' ($(echo $_c4 $_c6 | tr ' ' ',')) exits via the default route"
+            return 0
+            ;;
+        block)
+            for _c in $_c4; do nft add element inet wg_gw v4_block "{ $_c }" || return 1; done
+            for _c in $_c6; do nft add element inet wg_gw v6_block "{ $_c }" || return 1; done
+            log "[VPNGW] '$_u' ($(echo $_c4 $_c6 | tr ' ' ',')) is blocked"
+            return 0
+            ;;
+    esac
+    _line="$(gw_line "$_gw")"
+    [ -n "$_line" ] || { log_error "[VPNGW] gateway '$_gw' not found in state"; return 1; }
+    _table="$(echo "$_line" | awk '{ print $2 }')"
+    _gw4="$(echo "$_line" | awk '{ print $3 }')"
+    _gw6="$(echo "$_line" | awk '{ print $4 }')"
+    for _c in $_c4; do
+        if [ "$_gw4" != "block" ]; then
+            ip rule add from "$_c" lookup "$_table" priority "$_prio" || return 1
+            nft add element inet wg_gw "gw_${_gw}_v4" "{ $_c }" || return 1
+        else
+            nft add element inet wg_gw v4_block "{ $_c }" || return 1
+        fi
+    done
+    for _c in $_c6; do
+        if [ "$_gw6" != "block" ]; then
+            ip -6 rule add from "$_c" lookup "$_table" priority "$_prio" || return 1
+            nft add element inet wg_gw "gw_${_gw}_v6" "{ $_c }" || return 1
+        else
+            nft add element inet wg_gw v6_block "{ $_c }" || return 1
+        fi
+    done
+    log "[VPNGW] '$_u' ($(echo $_c4 $_c6 | tr ' ' ',')) routed via gateway '$_gw' (table $_table; v4=$_gw4 v6=$_gw6)"
+    return 0
+}
+
+# Apply/clean a peer record (wrapper recording the applied state)
+vpngw_apply_peer() { # $1 = record, $2 = gateway (direct|block|name)
+    _ap_name="$(peer_name_of "$1")"
+    _ap_a4="$(peer_cidrs4 "$1" | paste -sd+ -)"; _ap_a4="${_ap_a4:--}"
+    _ap_a6="$(peer_cidrs6 "$1" | paste -sd+ -)"; _ap_a6="${_ap_a6:--}"
+    vpngw_cleanup_addrs "$_ap_a4" "$_ap_a6"
+    if vpngw_apply_addrs "$_ap_name" "$2" "$_ap_a4" "$_ap_a6"; then
+        mkdir -p "$vpngw_state_dir/applied"
+        printf '%s %s %s\n' "$2" "$_ap_a4" "$_ap_a6" > "$vpngw_state_dir/applied/$_ap_name"
+        return 0
+    fi
+    vpngw_cleanup_addrs "$_ap_a4" "$_ap_a6"
+    return 1
+}
+
+vpngw_cleanup_peer() { # $1 = name
+    [ -f "$vpngw_state_dir/applied/$1" ] || return 0
+    read -r _ _a4 _a6 < "$vpngw_state_dir/applied/$1" || return 0
+    vpngw_cleanup_addrs "$_a4" "$_a6"
+    rm -f "$vpngw_state_dir/applied/$1"
+}
+
+# Effective gateway of a peer record: gw= option, else the VPN_PEER_GATEWAY
+# map (file wins), else "-" (unmapped -> subnet default).
+peer_effective_gw() {
+    _g="$(peer_opt "$1" gw)"
+    if [ "$_g" = "-" ] || [ -z "$_g" ]; then
+        _g="$(awk -v u="$(peer_name_of "$1")" '$1 == u { print $2; exit }' "$vpngw_state_dir/peer_map" 2>/dev/null)"
+        case "$_g" in drop) _g=block ;; esac
+    fi
+    printf '%s\n' "${_g:--}"
+}
+
+# Rebuild $vpngw_state_dir/peer_map from VPN_PEER_GATEWAY (+ file; file wins).
+# Validates every gateway name; returns 1 without touching the map on error.
+vpngw_build_peer_map() {
+    _tmp="$vpngw_state_dir/peer_map.new.$$"
+    kv_merge_env_file "$vpn_peer_gateway" "$vpn_peer_gateway_file" > "$_tmp"
+    _bad=0
+    while read -r _u _gw; do
+        [ -n "$_u" ] || continue
+        case "$_gw" in direct|block|drop) continue ;; esac
+        if [ -z "$(gw_line "$_gw")" ]; then
+            log_error "[VPNGW] peer-gateway map: unknown gateway '$_gw' for peer '$_u'"
+            _bad=1
+        fi
+    done < "$_tmp"
+    [ "$_bad" = 0 ] || { rm -f "$_tmp"; return 1; }
+    mv "$_tmp" "$vpngw_state_dir/peer_map"
+}
+
+# ---- Kill switch (table inet wg_gw) ----------------------------------------------
+# Forward hook, priority -10: per-gateway guards, direct/block sets, subnet
+# default. In sidecar mode (LOCAL_GATEWAY set) also input/output chains with
+# policy drop. Set declarations and rules are emitted separately so the
+# resolver can rebuild the chain in place, keeping set membership.
+
+vpngw_killswitch_sets() {
+    if [ -f "$vpngw_state_dir/gateways" ]; then
+        while read -r _name _tbl _g4 _g6; do
+            [ -n "$_name" ] || continue
+            [ "$_g4" != "block" ] && printf 'set gw_%s_v4 { type ipv4_addr; flags interval; }\n' "$_name"
+            [ "$_g6" != "block" ] && printf 'set gw_%s_v6 { type ipv6_addr; flags interval; }\n' "$_name"
+        done < "$vpngw_state_dir/gateways"
+    fi
+    printf 'set direct_v4 { type ipv4_addr; flags interval; }\n'
+    printf 'set direct_v6 { type ipv6_addr; flags interval; }\n'
+    printf 'set v4_block { type ipv4_addr; flags interval; }\n'
+    printf 'set v6_block { type ipv6_addr; flags interval; }\n'
+    printf 'set lan4 { type ipv4_addr; flags interval; }\n'
+    printf 'set lan6 { type ipv6_addr; flags interval; }\n'
+    printf 'set bootstrap_dns4 { type ipv4_addr; }\n'
+    printf 'set bootstrap_dns6 { type ipv6_addr; }\n'
+}
+
+# Guard for one gateway family: traffic from @set may leave only toward its
+# next-hop (IP gateways: via WAN_IF with that next-hop) or only via its
+# tunnel interface (dev gateways). $1 = set, $2 = ip|ip6, $3 = gw token
+vpngw_guard_rules() {
+    if gw_is_dev "$3"; then
+        printf '%s saddr @%s oifname != { "%s", "%s" } drop\n' "$2" "$1" "$(gw_dev_of "$3")" "$wg_if"
+        printf '%s saddr @%s oifname "%s" accept\n' "$2" "$1" "$(gw_dev_of "$3")"
+    else
+        printf '%s saddr @%s oifname "%s" rt %s nexthop != %s drop\n' "$2" "$1" "$wan_if" "$2" "$3"
+        printf '%s saddr @%s oifname "%s" accept\n' "$2" "$1" "$wan_if"
+    fi
+}
+
+vpngw_killswitch_rules() {
+    _sub4="-"; _sub6="-"
+    if [ -f "$vpngw_state_dir/subnet" ]; then
+        read -r _sub4 _sub6 < "$vpngw_state_dir/subnet" || true
+        [ -n "$_sub4" ] || _sub4="-"
+        [ -n "$_sub6" ] || _sub6="-"
+    fi
+    if [ -f "$vpngw_state_dir/gateways" ]; then
+        while read -r _name _tbl _g4 _g6; do
+            [ -n "$_name" ] || continue
+            [ "$_g4" != "block" ] && vpngw_guard_rules "gw_${_name}_v4" ip "$_g4"
+            [ "$_g6" != "block" ] && vpngw_guard_rules "gw_${_name}_v6" ip6 "$_g6"
+        done < "$vpngw_state_dir/gateways"
+    fi
+    printf 'ip saddr @direct_v4 oifname "%s" accept\n' "$wan_if"
+    printf 'ip6 saddr @direct_v6 oifname "%s" accept\n' "$wan_if"
+    printf 'ip saddr @v4_block reject with icmp type admin-prohibited\n'
+    printf 'ip6 saddr @v6_block reject with icmpv6 type admin-prohibited\n'
+    case "$_sub4" in
+        -)     : ;;
+        block) printf 'ip saddr %s oifname "%s" reject with icmp type admin-prohibited\n' "$vpn_subnet" "$wan_if" ;;
+        dev:*) printf 'iifname "%s" ip saddr %s oifname != { "%s", "%s" } drop\n' "$wg_if" "$vpn_subnet" "$(gw_dev_of "$_sub4")" "$wg_if" ;;
+        *)     printf 'ip saddr %s oifname "%s" rt ip nexthop != %s drop\n' "$vpn_subnet" "$wan_if" "$_sub4" ;;
+    esac
+    case "$_sub6" in
+        direct)  : ;;
+        -|block) printf 'meta nfproto ipv6 iifname "%s" reject with icmpv6 type admin-prohibited\n' "$wg_if" ;;
+        dev:*)   printf 'iifname "%s" ip6 saddr %s oifname != { "%s", "%s" } drop\n' "$wg_if" "$ipv6_subnet" "$(gw_dev_of "$_sub6")" "$wg_if" ;;
+        *)       printf 'ip6 saddr %s oifname "%s" rt ip6 nexthop != %s drop\n' "$ipv6_subnet" "$wan_if" "$_sub6" ;;
+    esac
+}
+
+# Sidecar-mode input/output chains (policy drop). Emitted only when
+# LOCAL_GATEWAY steers local traffic into a tunnel.
+vpngw_local_chains() {
+    [ "$local_gateway" != "direct" ] || return 0
+    _ports="$listen_port"
+    for _f in "$peers_dir"/*/port; do
+        [ -f "$_f" ] && _ports="$_ports, $(cat "$_f")"
+    done 2>/dev/null
+    cat <<EOT
+    chain output {
+        type filter hook output priority 0; policy drop;
+        oifname "lo" accept
+        ct state established,related accept
+        oifname "$wg_if" accept
+        oifname "wg-*" accept
+        meta mark $wg_fwmark meta l4proto udp accept
+        oifname "$wan_if" ip daddr @bootstrap_dns4 udp dport 53 accept
+        oifname "$wan_if" ip daddr @bootstrap_dns4 tcp dport 53 accept
+        oifname "$wan_if" ip6 daddr @bootstrap_dns6 udp dport 53 accept
+        oifname "$wan_if" ip6 daddr @bootstrap_dns6 tcp dport 53 accept
+        meta l4proto ipv6-icmp icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit } accept
+        oifname "$wan_if" ip daddr @lan4 accept
+        oifname "$wan_if" ip6 daddr @lan6 accept
+    }
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iifname "lo" accept
+        ct state established,related accept
+        iifname "$wg_if" accept
+        iifname "wg-*" accept
+        udp dport { $_ports } accept
+        meta l4proto ipv6-icmp icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept
+        iifname "$wan_if" ip saddr @lan4 accept
+        iifname "$wan_if" ip6 saddr @lan6 accept
+    }
+EOT
+}
+
+vpngw_load_killswitch() {
+    _sets="$(vpngw_killswitch_sets)"
+    _rules="$(vpngw_killswitch_rules)"
+    nft delete table inet wg_gw 2>/dev/null || true
+    nft -f - <<EOT || return 1
+table inet wg_gw {
+$(printf '%s' "$_sets" | awk 'NF { print "    " $0 }')
+    chain forward {
+        type filter hook forward priority -10; policy accept;
+$(printf '%s' "$_rules" | awk 'NF { print "        " $0 }')
+    }
+$(vpngw_local_chains)
+}
+EOT
+    _l4="$(split_list "$network" | nft_set_literal || true)"
+    _l6="$(split_list "$network6" | nft_set_literal || true)"
+    [ -n "$_l4" ] && nft add element inet wg_gw lan4 "$_l4"
+    [ -n "$_l6" ] && nft add element inet wg_gw lan6 "$_l6"
+    # Resolvers Docker gave us: endpoint hostnames are resolved through them
+    # (off-tunnel by necessity - the tunnel does not exist yet)
+    _b4="$(bootstrap_nameservers | grep -v ':' | nft_set_literal || true)"
+    _b6="$(bootstrap_nameservers | grep ':' | grep -v '%' | nft_set_literal || true)"
+    [ -n "$_b4" ] && nft add element inet wg_gw bootstrap_dns4 "$_b4"
+    [ -n "$_b6" ] && nft add element inet wg_gw bootstrap_dns6 "$_b6"
+    return 0
+}
+
+# Rebuild ONLY the forward chain in place (sets and membership untouched)
+vpngw_reload_killswitch() {
+    _rules="$(vpngw_killswitch_rules)"
+    nft -f - <<EOT
+flush chain inet wg_gw forward
+$(printf '%s' "$_rules" | awk 'NF { print "add rule inet wg_gw forward " $0 }')
+EOT
+}
+
+# ---- Re-resolution (DNS-named next-hops, upstream endpoints) -------------------
+
+# Re-resolve every DNS-named gateway; on a moved next-hop replace the table's
+# default route and rebuild the kill-switch chain in place. A name that fails
+# to resolve keeps its last-known-good address. Caller holds the lock.
+vpngw_reconcile_gateways() {
+    [ -d "$vpngw_state_dir" ] || return 0
+    _changed=0
+    if [ -f "$vpngw_state_dir/gateways" ] && [ -f "$vpngw_state_dir/gateways.src" ]; then
+        _tmp="$vpngw_state_dir/gateways.reconcile.$$"
+        : > "$_tmp"
+        while read -r _name _tbl _cur4 _cur6; do
+            [ -n "$_name" ] || continue
+            _srcline="$(awk -v n="$_name" '$1 == n { print $2, $3; exit }' "$vpngw_state_dir/gateways.src")"
+            _s4="${_srcline%% *}"; _s6="${_srcline##* }"
+            _new4="$_cur4"; _new6="$_cur6"
+            if ! gw_is_literal "$_s4"; then
+                if _r="$(gw_resolve_stable -4 "$_s4" "$_cur4")"; then _new4="$_r"
+                else log_error "[VPNGW-RESOLVE] gateway '$_name': cannot resolve IPv4 host '$_s4'; keeping $_cur4"; fi
+            fi
+            if ! gw_is_literal "$_s6"; then
+                if _r="$(gw_resolve_stable -6 "$_s6" "$_cur6")"; then _new6="$_r"
+                else log_error "[VPNGW-RESOLVE] gateway '$_name': cannot resolve IPv6 host '$_s6'; keeping $_cur6"; fi
+            fi
+            if [ "$_new4" != "$_cur4" ]; then
+                if ip route replace default via "$_new4" table "$_tbl"; then
+                    log "[VPNGW-RESOLVE] gateway '$_name' IPv4 $_cur4 -> $_new4 (table $_tbl)"; _changed=1
+                else
+                    log_error "[VPNGW-RESOLVE] gateway '$_name': ip route replace via $_new4 failed; keeping $_cur4"; _new4="$_cur4"
+                fi
+            fi
+            if [ "$_new6" != "$_cur6" ]; then
+                if ip -6 route replace default via "$_new6" table "$_tbl"; then
+                    log "[VPNGW-RESOLVE] gateway '$_name' IPv6 $_cur6 -> $_new6 (table $_tbl)"; _changed=1
+                else
+                    log_error "[VPNGW-RESOLVE] gateway '$_name': ip -6 route replace via $_new6 failed; keeping $_cur6"; _new6="$_cur6"
+                fi
+            fi
+            printf '%s %s %s %s\n' "$_name" "$_tbl" "$_new4" "$_new6" >> "$_tmp"
+        done < "$vpngw_state_dir/gateways"
+        mv "$_tmp" "$vpngw_state_dir/gateways"
+    fi
+    if [ -f "$vpngw_state_dir/subnet" ]; then
+        read -r _cur4 _cur6 < "$vpngw_state_dir/subnet" || true
+        _new4="$_cur4"; _new6="$_cur6"
+        if [ -n "$vpn_gateway" ] && ! gw_is_literal "$vpn_gateway"; then
+            if _r="$(gw_resolve_stable -4 "$vpn_gateway" "$_cur4")"; then _new4="$_r"
+            else log_error "[VPNGW-RESOLVE] subnet default: cannot resolve IPv4 host '$vpn_gateway'; keeping $_cur4"; fi
+        fi
+        if [ -n "$vpn_gateway6" ] && ! gw_is_literal "$vpn_gateway6"; then
+            if _r="$(gw_resolve_stable -6 "$vpn_gateway6" "$_cur6")"; then _new6="$_r"
+            else log_error "[VPNGW-RESOLVE] subnet default: cannot resolve IPv6 host '$vpn_gateway6'; keeping $_cur6"; fi
+        fi
+        if [ "$_new4" != "$_cur4" ]; then
+            if ip route replace default via "$_new4" table "$vpn_gateway_table"; then
+                log "[VPNGW-RESOLVE] subnet default IPv4 $_cur4 -> $_new4"; _changed=1
+            else _new4="$_cur4"; fi
+        fi
+        if [ "$_new6" != "$_cur6" ]; then
+            if ip -6 route replace default via "$_new6" table "$vpn_gateway_table"; then
+                log "[VPNGW-RESOLVE] subnet default IPv6 $_cur6 -> $_new6"; _changed=1
+            else _new6="$_cur6"; fi
+        fi
+        printf '%s %s\n' "$_new4" "$_new6" > "$vpngw_state_dir/subnet"
+    fi
+    if [ "$_changed" = 1 ]; then
+        vpngw_reload_killswitch && log "[VPNGW-RESOLVE] Kill-switch chain rebuilt for new next-hop(s)" \
+            || log_error "[VPNGW-RESOLVE] Warning: kill-switch chain rebuild failed after re-resolve"
+    fi
+    return 0
+}
+
+# Age in seconds of the latest handshake of interface $1 (empty = never)
+wg_handshake_age() {
+    _hs="$(wg show "$1" latest-handshakes 2>/dev/null | awk '{ print $2; exit }')"
+    [ -n "$_hs" ] && [ "$_hs" != "0" ] || return 1
+    echo $(( $(date +%s) - _hs ))
+}
+
+# Re-resolve dial-out exit nodes' / upstreams' Endpoint hostnames.
+# State: $state_dir/ifaces/<iface>.endpoint = "pubkey host port current_ip".
+# The endpoint is re-set when the address moved, or when the tunnel has had no
+# handshake for UPSTREAM_HANDSHAKE_TIMEOUT (a re-set kicks a fresh handshake
+# at the - possibly new - address). Literal-IP endpoints are left alone.
+upstreams_reconcile() {
+    for _ef in "$state_dir"/ifaces/*.endpoint; do
+        [ -f "$_ef" ] || continue
+        _ifn="${_ef##*/}"; _ifn="${_ifn%.endpoint}"
+        read -r _pub _host _port _cur < "$_ef" || continue
+        gw_is_literal "$_host" && continue
+        _stale=0
+        _age="$(wg_handshake_age "$_ifn")" || _age=""
+        if [ -z "$_age" ] || [ "$_age" -gt "$upstream_handshake_timeout" ]; then _stale=1; fi
+        _new="$(gw_resolve_stable -4 "$_host" "$_cur" 2>/dev/null)" || _new="$(gw_resolve_stable -6 "$_host" "$_cur" 2>/dev/null)" || _new=""
+        if [ -z "$_new" ]; then
+            log_error "[UPSTREAM-RESOLVE] $_ifn: cannot resolve '$_host'; keeping $_cur"
+            continue
+        fi
+        if [ "$_new" != "$_cur" ] || [ "$_stale" = 1 ]; then
+            case "$_new" in *:*) _epstr="[$_new]:$_port" ;; *) _epstr="$_new:$_port" ;; esac
+            if wg set "$_ifn" peer "$_pub" endpoint "$_epstr"; then
+                [ "$_new" != "$_cur" ] && log "[UPSTREAM-RESOLVE] $_ifn: endpoint $_host moved $_cur -> $_new" \
+                    || log "[UPSTREAM-RESOLVE] $_ifn: no handshake for ${_age:-ever}s; endpoint re-set to $_new"
+                printf '%s %s %s %s\n' "$_pub" "$_host" "$_port" "$_new" > "$_ef"
+            else
+                log_error "[UPSTREAM-RESOLVE] $_ifn: wg set endpoint $_epstr failed"
+            fi
+        fi
+    done
+    return 0
+}
+
+# ---- WireGuard interface helpers -------------------------------------------------
+
+# Create a WireGuard interface: kernel module first, wireguard-go fallback.
+wg_if_create() { # $1 = name
+    ip link show "$1" >/dev/null 2>&1 && return 0
+    if ip link add "$1" type wireguard 2>/dev/null; then
+        echo kernel > "$state_dir/backend"
+        return 0
+    fi
+    if command -v wireguard-go >/dev/null 2>&1; then
+        if [ ! -e /dev/net/tun ]; then
+            log_error "[WG] no kernel WireGuard and /dev/net/tun is missing (add 'devices: - /dev/net/tun' for the wireguard-go fallback)"
+            return 1
+        fi
+        if WG_PROCESS_FOREGROUND=0 wireguard-go "$1" 2>/dev/null; then
+            echo wireguard-go > "$state_dir/backend"
+            log "[WG] kernel WireGuard unavailable; $1 runs on wireguard-go (userspace)"
+            return 0
+        fi
+    fi
+    log_error "[WG] cannot create interface $1 (load the wireguard module on the host, or provide /dev/net/tun for wireguard-go)"
+    return 1
+}
+
+wg_if_destroy() { # $1 = name
+    ip link show "$1" >/dev/null 2>&1 || return 0
+    ip link del "$1" 2>/dev/null || true
+    # wireguard-go exits when its tun is removed; make sure
+    pkill -f "wireguard-go $1" 2>/dev/null || true
+}
+
+# Bring an interface up with a wg config and addresses.
+# $1 = name, $2 = conf, $3 = v4 CIDR, $4 = v6 CIDR (may be empty), $5 = mtu
+wg_if_up() {
+    wg_if_create "$1" || return 1
+    wg setconf "$1" "$2" || { log_error "[WG] wg setconf $1 failed"; return 1; }
+    ip addr replace "$3" dev "$1" || return 1
+    if [ -n "${4:-}" ] && ipv6_available; then
+        ip -6 addr replace "$4" dev "$1" || log_error "[WG] Warning: could not add $4 to $1"
+    fi
+    ip link set mtu "${5:-$wg_mtu}" dev "$1" || return 1
+    ip link set up dev "$1" || return 1
+}
+
+# ---- Egress probe machinery (shared: network-diagnostic, healthcheck) ------
+# Sends locally generated test traffic through a chosen routing table to
+# verify an egress path end to end, without touching any live rule: a
+# temporary route-type output chain fwmarks traffic to the test destination,
+# a mark-scoped masquerade covers multi-interface deployments, and an
+# "fwmark -> <table>" policy rule steers it. Each consumer sets its OWN
+# table/mark/prio triple before probe_arm (network-diagnostic:
+# wg_diag/0xd1a6/790, healthcheck: wg_health/0xd1a7/791).
+PROBE_TABLE="${PROBE_TABLE:-wg_diag}"
+PROBE_MARK="${PROBE_MARK:-0xd1a6}"
+PROBE_PRIO="${PROBE_PRIO:-790}"
+PROBE_TEST4="1.1.1.1"
+PROBE_TEST6="2606:4700:4700::1111"
+PROBE_TRACE4="https://1.1.1.1/cdn-cgi/trace"
+PROBE_TRACE6="https://[2606:4700:4700::1111]/cdn-cgi/trace"
+PROBE_TIMEOUT="${PROBE_TIMEOUT:-8}"
+PROBE_ARMED=0
+
+fetch_url() { curl -fsS --max-time "$PROBE_TIMEOUT" -o - "$1" 2>/dev/null; }
+
+probe_cleanup() {
+    [ "$PROBE_ARMED" = 1 ] || return 0
+    _pc_n=0
+    while [ "$_pc_n" -lt 8 ] && ip rule del priority "$PROBE_PRIO" 2>/dev/null; do _pc_n=$((_pc_n + 1)); done
+    _pc_n=0
+    while [ "$_pc_n" -lt 8 ] && ip -6 rule del priority "$PROBE_PRIO" 2>/dev/null; do _pc_n=$((_pc_n + 1)); done
+    nft delete table inet "$PROBE_TABLE" 2>/dev/null || true
+    PROBE_ARMED=0
+}
+
+probe_arm() {
+    [ "$PROBE_ARMED" = 1 ] && return 0
+    nft -f - <<EOT || return 1
+table inet $PROBE_TABLE {
+    chain output {
+        type route hook output priority mangle; policy accept;
+    }
+    chain postrouting {
+        type nat hook postrouting priority 110; policy accept;
+    }
+}
+EOT
+    PROBE_ARMED=1
+}
+
+probe_rules_clear() {
+    nft flush chain inet "$PROBE_TABLE" output 2>/dev/null
+    nft flush chain inet "$PROBE_TABLE" postrouting 2>/dev/null
+}
+
+probe_set_mark() { # $1 = family 4|6, $2 = mark
+    probe_rules_clear
+    if [ "$1" = 4 ]; then
+        nft add rule inet "$PROBE_TABLE" output ip daddr "$PROBE_TEST4" tcp dport 443 meta mark set "$2" \
+            && nft add rule inet "$PROBE_TABLE" postrouting ip daddr "$PROBE_TEST4" meta mark "$2" masquerade
+    else
+        nft add rule inet "$PROBE_TABLE" output ip6 daddr "$PROBE_TEST6" tcp dport 443 meta mark set "$2" \
+            && nft add rule inet "$PROBE_TABLE" postrouting ip6 daddr "$PROBE_TEST6" meta mark "$2" masquerade
+    fi
+}
+
+probe_fetch_raw() { # $1 = family
+    if [ "$1" = 4 ]; then _pf_body="$(fetch_url "$PROBE_TRACE4")"; else _pf_body="$(fetch_url "$PROBE_TRACE6")"; fi
+    [ -n "$_pf_body" ] || return 1
+    printf '%s\n' "$_pf_body"
+}
+
+probe_table_raw() { # $1 = table (or "main"), $2 = family; prints trace body
+    probe_set_mark "$2" "$PROBE_MARK" >/dev/null 2>&1 || return 1
+    if [ "$2" = 4 ]; then
+        ip rule add fwmark "$PROBE_MARK" lookup "$1" priority "$PROBE_PRIO" 2>/dev/null || return 1
+        _pt_r="$(probe_fetch_raw 4)"; _pt_rc=$?
+        ip rule del priority "$PROBE_PRIO" 2>/dev/null
+    else
+        ip -6 rule add fwmark "$PROBE_MARK" lookup "$1" priority "$PROBE_PRIO" 2>/dev/null || return 1
+        _pt_r="$(probe_fetch_raw 6)"; _pt_rc=$?
+        ip -6 rule del priority "$PROBE_PRIO" 2>/dev/null
+    fi
+    probe_rules_clear
+    [ "$_pt_rc" = 0 ] || return 1
+    printf '%s\n' "$_pt_r"
+}
+
+# ---- Peer status (wg show) -----------------------------------------------------------
+# "pubkey endpoint allowed-ips latest-handshake rx tx keepalive" per peer of wg0
+wg_peer_dump() { wg show "${1:-$wg_if}" dump 2>/dev/null | awk 'NR > 1 { print $1, $3, $4, $5, $6, $7, $8 }'; }

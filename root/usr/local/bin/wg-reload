@@ -1,0 +1,135 @@
+#!/bin/sh
+# shellcheck shell=sh
+#
+# Reload peers and maps IN PLACE: re-parse PEERS + PEERS_FILE and the
+# peer -> gateway map, sync the peer list into wg0 (wg syncconf: untouched
+# peers keep their session), reconcile the per-peer policy rules and
+# kill-switch membership, and regenerate device configs. Exit nodes already up
+# are re-synced too (key/endpoint changes); adding or removing an exit node or
+# upstream needs a restart (interfaces and tables are created at boot).
+#
+# Run it manually:   docker exec <container> wg-reload
+# Or automatically:  PEERS_WATCH=1 / VPN_PEER_GATEWAY_WATCH=1
+#
+# All-or-nothing: an invalid definition aborts before anything is touched.
+
+set -u
+
+. /usr/local/bin/backend-functions
+
+# Invoked by inotifyd as a directory watcher: args are EVENTS DIR SUBFILE.
+# Ignore events for files other than the ones we watch.
+if [ -n "${3:-}" ]; then
+    case "$3" in
+        "$(basename "$peers_file")") ;;
+        *) [ -n "$vpn_peer_gateway_file" ] && [ "$3" = "$(basename "$vpn_peer_gateway_file")" ] || exit 0 ;;
+    esac
+fi
+
+[ -f "$peers_applied" ] || { log_error "[WG-RELOAD] Not initialised yet; nothing to reload"; exit 1; }
+ip link show "$wg_if" >/dev/null 2>&1 || { log_error "[WG-RELOAD] $wg_if is not up; nothing to reload"; exit 1; }
+
+(
+    flock 9
+    if ! peers_normalize; then
+        log_error "[WG-RELOAD] Invalid peer definitions; live state left unchanged"
+        exit 1
+    fi
+    if ! vpngw_build_peer_map; then
+        log_error "[WG-RELOAD] Invalid peer-gateway map; live state left unchanged"
+        exit 1
+    fi
+    # New exit nodes need interfaces/tables that only init creates
+    while IFS= read -r rec; do
+        [ -n "$rec" ] || continue
+        [ "$(peer_opt "$rec" exit)" = "true" ] || continue
+        n="$(peer_name_of "$rec")"
+        if ! grep -q "^$n " "$state_dir/ifaces/list" 2>/dev/null; then
+            log_error "[WG-RELOAD] exit node '$n' is new; restart the container to create its interface"
+            exit 1
+        fi
+    done < "$peers_state"
+    if ! peers_check_gateways; then
+        log_error "[WG-RELOAD] Peer definitions reference unknown gateways; live state left unchanged"
+        exit 1
+    fi
+
+    # 1. wg0 peer list
+    wg_conf_build
+    if ! wg syncconf "$wg_if" "$wg_conf"; then
+        log_error "[WG-RELOAD] wg syncconf failed; routing left unchanged"
+        exit 1
+    fi
+
+    # 2. exit node interfaces (key / endpoint / psk changes)
+    while IFS= read -r rec; do
+        [ -n "$rec" ] || continue
+        [ "$(peer_opt "$rec" exit)" = "true" ] || continue
+        n="$(peer_name_of "$rec")"
+        old="$(peer_record "$n" "$peers_applied")"
+        [ "$old" = "$rec" ] && continue
+        exit_conf_build "$rec"
+        ep="$(peer_opt "$rec" endpoint)"
+        if [ "$ep" != "-" ]; then
+            host="${ep%:*}"; port="${ep##*:}"; host="${host#[}"; host="${host%]}"
+            cur="$host"; gw_is_literal "$host" || cur="$(gw_resolve_one -4 "$host" || gw_resolve_one -6 "$host" || true)"
+            if [ -n "$cur" ]; then
+                case "$cur" in *:*) sed -i "s|^Endpoint = .*|Endpoint = [$cur]:$port|" "$state_dir/wg-$n.conf" ;; *) sed -i "s|^Endpoint = .*|Endpoint = $cur:$port|" "$state_dir/wg-$n.conf" ;; esac
+            else
+                sed -i '/^Endpoint = /d' "$state_dir/wg-$n.conf"
+            fi
+            printf '%s %s %s %s\n' "$(peer_opt "$rec" key)" "$host" "$port" "${cur:-unresolved}" > "$state_dir/ifaces/wg-$n.endpoint"
+        fi
+        wg syncconf "wg-$n" "$state_dir/wg-$n.conf" && log "[WG-RELOAD] exit node '$n' re-synced" \
+            || log_error "[WG-RELOAD] Warning: wg syncconf wg-$n failed"
+    done < "$peers_state"
+
+    # 3. allowed= routes
+    new_routes="$(while IFS= read -r rec; do
+        [ -n "$rec" ] || continue
+        [ "$(peer_opt "$rec" exit)" = "true" ] && continue
+        [ "$(peer_opt "$rec" enabled)" = "true" ] || continue
+        al="$(peer_opt "$rec" allowed)"; [ "$al" != "-" ] && printf '%s\n' "$al" | tr '+' '\n'
+    done < "$peers_state" | sort -u)"
+    old_routes="$(sort -u "$state_dir/allowed_routes" 2>/dev/null)"
+    for c in $old_routes; do printf '%s\n' "$new_routes" | grep -qxF "$c" || ip route del "$c" dev "$wg_if" 2>/dev/null || true; done
+    for c in $new_routes; do printf '%s\n' "$old_routes" | grep -qxF "$c" || ip route replace "$c" dev "$wg_if" 2>/dev/null || true; done
+    printf '%s\n' "$new_routes" | sed '/^$/d' > "$state_dir/allowed_routes"
+
+    # 4. policy rules + kill-switch membership: remove gone/changed, add new/changed
+    changed=0
+    for f in "$vpngw_state_dir"/applied/*; do
+        [ -f "$f" ] || continue
+        n="${f##*/}"
+        [ "$n" = "_forward_from" ] && continue
+        rec="$(peer_record "$n")"
+        want="-"
+        if [ -n "$rec" ] && [ "$(peer_opt "$rec" exit)" != "true" ] && [ "$(peer_opt "$rec" enabled)" = "true" ]; then
+            want="$(peer_effective_gw "$rec")"
+            a4="$(peer_cidrs4 "$rec" | paste -sd+ -)"; a6="$(peer_cidrs6 "$rec" | paste -sd+ -)"
+            read -r ogw oa4 oa6 < "$f" || true
+            [ "$ogw $oa4 $oa6" = "$want ${a4:--} ${a6:--}" ] && continue
+        fi
+        vpngw_cleanup_peer "$n"
+        [ "$want" = "-" ] && { log "[WG-RELOAD] peer '$n' no longer mapped; follows the default route"; changed=$((changed + 1)); }
+    done
+    while IFS= read -r rec; do
+        [ -n "$rec" ] || continue
+        [ "$(peer_opt "$rec" exit)" = "true" ] && continue
+        [ "$(peer_opt "$rec" enabled)" = "true" ] || continue
+        n="$(peer_name_of "$rec")"
+        gw="$(peer_effective_gw "$rec")"
+        [ "$gw" = "-" ] && continue
+        [ -f "$vpngw_state_dir/applied/$n" ] && continue
+        if vpngw_apply_peer "$rec" "$gw"; then
+            changed=$((changed + 1))
+        else
+            log_error "[WG-RELOAD] Could not apply gateway '$gw' for '$n'; it follows the default route until fixed"
+        fi
+    done < "$peers_state"
+
+    # 5. device configs
+    peers_write_client_confs
+    cp "$peers_state" "$peers_applied"
+    log "[WG-RELOAD] Reload complete: $(wg show "$wg_if" peers | wc -l) peer(s) on $wg_if, $changed routing change(s)"
+) 9>"$wg_lock"

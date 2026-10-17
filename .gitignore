@@ -1,0 +1,4 @@
+.claude
+docker-compose.override.yml
+DESIGN.md
+test/

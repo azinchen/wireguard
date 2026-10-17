@@ -1,0 +1,55 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+#
+# Bring wg0 up from the generated config and hold it. WireGuard has no daemon
+# process: this longrun blocks, reloads peers in place on SIGHUP (s6-svc -h /
+# wg-reload) and tears the interface down in ./finish.
+
+set -eu
+
+. /usr/local/bin/backend-functions
+
+SCRIPT_NAME="SVC-WIREGUARD"
+
+wg_conf_build
+addr4="$(server_addr4)/${vpn_subnet#*/}"
+addr6=""
+ipv6_available && addr6="$(server_addr6)/${ipv6_subnet#*/}"
+if ! wg_if_up "$wg_if" "$wg_conf" "$addr4" "$addr6" "$wg_mtu"; then
+    log_error "[$SCRIPT_NAME] Could not bring up $wg_if; retrying in 10s"
+    sleep 10
+    exit 1
+fi
+
+# Routes to the networks behind peers (allowed= option)
+: > "$state_dir/allowed_routes"
+while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    [ "$(peer_opt "$rec" exit)" = "true" ] && continue
+    [ "$(peer_opt "$rec" enabled)" = "true" ] || continue
+    al="$(peer_opt "$rec" allowed)"
+    [ "$al" != "-" ] || continue
+    for c in $(printf '%s' "$al" | tr '+' ' '); do
+        ip route replace "$c" dev "$wg_if" 2>/dev/null && echo "$c" >> "$state_dir/allowed_routes" \
+            || log_error "[$SCRIPT_NAME] Warning: could not route $c via $wg_if (peer $(peer_name_of "$rec"))"
+    done
+done < "$peers_state"
+
+n="$(wg show "$wg_if" peers 2>/dev/null | wc -l)"
+log "[$SCRIPT_NAME] $wg_if up: $addr4${addr6:+, $addr6}, UDP $listen_port, MTU $wg_mtu, $n peer(s), backend $(cat "$state_dir/backend" 2>/dev/null || echo kernel)"
+while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    [ "$(peer_opt "$rec" exit)" = "true" ] && continue
+    gw="$(peer_effective_gw "$rec")"
+    en="$(peer_opt "$rec" enabled)"
+    log "[$SCRIPT_NAME]   peer $(peer_name_of "$rec"): $(peer_opt "$rec" ip) gw=${gw} $([ "$en" = true ] || echo '(disabled)')"
+done < "$peers_state"
+[ -z "$server_endpoint" ] && [ "$n" -gt 0 ] \
+    && log_error "[$SCRIPT_NAME] Reminder: SERVER_ENDPOINT is unset; device configs carry a placeholder endpoint"
+
+trap '/usr/local/bin/wg-reload || true' HUP
+trap 'exit 0' TERM INT
+while :; do
+    sleep 2147483647 &
+    wait $! || true
+done

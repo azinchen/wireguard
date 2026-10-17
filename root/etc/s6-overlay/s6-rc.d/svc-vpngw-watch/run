@@ -1,0 +1,27 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+#
+# Optional watcher for the peer -> gateway map file (VPN_PEER_GATEWAY_WATCH=1
+# -> VPN_PEER_GATEWAY_FILE). Re-runs wg-reload on change.
+
+set -eu
+
+. /usr/local/bin/backend-functions
+
+[ "$vpn_peer_gateway_watch" = "1" ] || exec sleep infinity
+if [ -z "$vpn_peer_gateway_file" ]; then
+    log_error "[VPNGW-WATCH] VPN_PEER_GATEWAY_WATCH=1 but VPN_PEER_GATEWAY_FILE is unset; not watching"
+    exec sleep infinity
+fi
+d="$(dirname "$vpn_peer_gateway_file")"
+[ -d "$d" ] || { log_error "[VPNGW-WATCH] Directory $d does not exist; not watching"; exec sleep infinity; }
+# Same directory as the peers file and PEERS_WATCH on: svc-peer-watch covers it
+if [ "$peers_watch" = "1" ] && [ "$d" = "$(dirname "$peers_file")" ]; then
+    exec sleep infinity
+fi
+log "[VPNGW-WATCH] Watching $vpn_peer_gateway_file for changes"
+# svc-wireguard is "started" before wg0 exists; give it a moment so the
+# initial catch-up reload has an interface to sync
+_n=0; while [ "$_n" -lt 20 ] && ! ip link show "$wg_if" >/dev/null 2>&1; do sleep 0.5; _n=$((_n + 1)); done
+/usr/local/bin/wg-reload || true
+exec inotifyd /usr/local/bin/wg-reload "$d:yw"

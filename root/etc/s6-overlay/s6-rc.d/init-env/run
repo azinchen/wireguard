@@ -1,0 +1,132 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+#
+# Validate the environment, generate what is missing (server key, peer keys,
+# addresses) and write the normalized peer definitions. Any configuration
+# error fails this oneshot, which aborts container start
+# (S6_BEHAVIOUR_IF_STAGE2_FAILS=2) with a clear log line.
+
+set -eu
+
+. /usr/local/bin/backend-functions
+
+SCRIPT_NAME="INIT-ENV"
+
+fatal() {
+    log_error "[$SCRIPT_NAME] ERROR: $1"
+    exit 1
+}
+
+mkdir -p "$state_dir" "$state_dir/ifaces" "$config_dir"
+chmod 0755 "$state_dir"
+rm -rf "$state_dir/ifaces"/* "$vpngw_state_dir"
+
+log "[$SCRIPT_NAME] wireguard image $image_version (built $image_build_date) starting"
+log "[$SCRIPT_NAME] $(wg --version 2>/dev/null || echo 'wg (version unknown)')"
+
+# ---- IPv6 availability -----------------------------------------------------
+try_sysctl() {
+    _path="$1"; _want="$2"
+    [ -f "$_path" ] || return 1
+    [ "$(cat "$_path")" = "$_want" ] && return 0
+    echo "$_want" > "$_path" 2>/dev/null && return 0
+    return 1
+}
+has_ipv6=0
+if [ -e /proc/net/if_inet6 ] && try_sysctl /proc/sys/net/ipv6/conf/all/disable_ipv6 0; then
+    has_ipv6=1
+else
+    log "[$SCRIPT_NAME] IPv6 is not usable in this container; IPv6 features are skipped"
+fi
+echo "$has_ipv6" > "$has_ipv6_file"
+
+# ---- Numbers and CIDRs ------------------------------------------------------
+is_cidr4 "$vpn_subnet" && [ "${vpn_subnet#*/}" -le 30 ] || fatal "VPN_SUBNET must be an IPv4 CIDR no smaller than /30 (got '$vpn_subnet')"
+is_cidr4 "$exit_subnet" && [ "${exit_subnet#*/}" -le 30 ] || fatal "EXIT_SUBNET must be an IPv4 CIDR no smaller than /30 (got '$exit_subnet')"
+for _v in IPV6_SUBNET EXIT_SUBNET6; do
+    eval "_s=\$$(echo "$_v" | tr '[:upper:]' '[:lower:]')"
+    is_cidr6 "$_s" && [ "${_s#*/}" -le 64 ] && ip6_prefix_text "$_s" >/dev/null \
+        || fatal "$_v must be written as <prefix>::/N with N <= 64 (got '$_s')"
+done
+is_number "$listen_port" && [ "$listen_port" -ge 1 ] && [ "$listen_port" -le 65535 ] || fatal "LISTEN_PORT must be 1-65535 (got '$listen_port')"
+[ -z "$exit_port_base" ] || { is_number "$exit_port_base" && [ "$exit_port_base" -le 65535 ]; } || fatal "EXIT_PORT_BASE must be a port number"
+is_number "$wg_mtu" && [ "$wg_mtu" -ge 1280 ] && [ "$wg_mtu" -le 65535 ] || fatal "MTU must be 1280-65535 (got '$wg_mtu')"
+is_number "$peer_keepalive" || fatal "PEER_KEEPALIVE must be a number of seconds (got '$peer_keepalive')"
+is_number "$upstream_handshake_timeout" || fatal "UPSTREAM_HANDSHAKE_TIMEOUT must be a number of seconds"
+is_number "$vpn_gateway_table" && is_number "$vpn_gateway_rule_prio" && is_number "$vpn_gateway_peer_rule_prio" && is_number "$local_gateway_rule_prio" \
+    || fatal "VPN_GATEWAY_TABLE / *_RULE_PRIO must be numbers"
+[ "$vpn_gateway_peer_rule_prio" -lt "$vpn_gateway_rule_prio" ] || fatal "VPN_GATEWAY_PEER_RULE_PRIO ($vpn_gateway_peer_rule_prio) must be below VPN_GATEWAY_RULE_PRIO ($vpn_gateway_rule_prio)"
+[ "$local_gateway_rule_prio" -gt "$vpn_gateway_rule_prio" ] || fatal "LOCAL_GATEWAY_RULE_PRIO ($local_gateway_rule_prio) must be above VPN_GATEWAY_RULE_PRIO ($vpn_gateway_rule_prio)"
+case "$vpn_gateways_resolve_interval" in ''|*[!0-9]*) fatal "VPN_GATEWAYS_RESOLVE_INTERVAL must be a number of seconds" ;; esac
+( : "$((wg_fwmark))" ) 2>/dev/null && [ "$((wg_fwmark))" -gt 0 ] || fatal "WG_FWMARK must be a positive number (decimal or 0x hex)"
+
+if [ -n "$tcp_mss" ]; then
+    is_number "$tcp_mss" && [ "$tcp_mss" -ge 536 ] && [ "$tcp_mss" -le 65535 ] || fatal "MSS must be 536-65535 (got '$tcp_mss')"
+fi
+if [ -n "$ttl_set" ]; then
+    case "$ttl_set" in *[!0-9]*|0*|????*) fatal "TTL_SET must be an integer 1-255, no leading zeros (got '$ttl_set')" ;; esac
+    [ "$ttl_set" -le 255 ] || fatal "TTL_SET must be an integer 1-255 (got '$ttl_set')"
+fi
+[ -z "$ttl_inc" ] || fatal "TTL_INC is not supported by this image yet (reserved for a later phase); unset it or use TTL_SET"
+[ "$gateway_dns" = "off" ] || fatal "GATEWAY_DNS is not supported by this image yet (phase 3); unset it"
+
+for _c in $(split_list "$forward_from"); do
+    [ "$_c" = "auto" ] || is_cidr4 "$_c" || fatal "FORWARD_FROM entry '$_c' is not an IPv4 CIDR (or 'auto')"
+done
+for _c in $(split_list "$forward_from6"); do
+    [ "$_c" = "auto" ] || is_cidr6 "$_c" || fatal "FORWARD_FROM6 entry '$_c' is not an IPv6 CIDR (or 'auto')"
+done
+for _c in $(split_list "$network"); do is_cidr4 "$_c" || is_ipv4 "$_c" || fatal "NETWORK entry '$_c' is not an IPv4 CIDR"; done
+for _c in $(split_list "$network6"); do is_cidr6 "$_c" || is_ipv6 "$_c" || fatal "NETWORK6 entry '$_c' is not an IPv6 CIDR"; done
+if [ "$local_gateway" != "direct" ]; then
+    peer_name_valid "$local_gateway" || fatal "LOCAL_GATEWAY must be 'direct' or a gateway name (got '$local_gateway')"
+elif [ -n "$forward_from$forward_from6" ]; then
+    fatal "FORWARD_FROM needs LOCAL_GATEWAY set to the exit the clients should use"
+fi
+
+# ---- Keys and peers ----------------------------------------------------------
+server_keys_ensure || fatal "could not generate the server keypair"
+log "[$SCRIPT_NAME] Server public key: $(server_pubkey)"
+
+peers_normalize || fatal "invalid peer definitions (PEERS / $peers_file); see the lines above"
+
+n_peers=0; n_exit=0; n_dialin=0
+while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    if [ "$(peer_opt "$rec" exit)" = "true" ]; then
+        n_exit=$((n_exit + 1))
+        [ "$(peer_opt "$rec" endpoint)" = "-" ] && n_dialin=$((n_dialin + 1))
+    else
+        n_peers=$((n_peers + 1))
+    fi
+done < "$peers_state"
+if [ -z "$server_endpoint" ] && [ $((n_peers + n_dialin)) -gt 0 ]; then
+    log_error "[$SCRIPT_NAME] Warning: SERVER_ENDPOINT is unset - generated configs for nodes that dial this server carry the placeholder <SERVER_ENDPOINT>; set it to your public host[:port]"
+fi
+peers_write_client_confs
+log "[$SCRIPT_NAME] Peers: $n_peers on $wg_if, $n_exit exit node(s) ($n_dialin dial-in)"
+if [ -f "$peers_file" ]; then
+    log "[$SCRIPT_NAME] Peer definitions: PEERS env + $peers_file (file wins)"
+fi
+
+# ---- Sidecar role: resolv.conf ------------------------------------------------
+# Docker's embedded resolver forwards via the host, outside the tunnel and the
+# kill switch; with local traffic steered into a tunnel the container must
+# resolve through it instead.
+if [ "$local_gateway" != "direct" ]; then
+    # Keep Docker's resolvers for bootstrap resolution of endpoint hostnames
+    if ! grep -q 'Generated by wireguard' /etc/resolv.conf 2>/dev/null; then
+        cp /etc/resolv.conf "$state_dir/resolv.conf.orig" 2>/dev/null || true
+    fi
+    if {
+        echo "# Generated by wireguard (LOCAL_GATEWAY=$local_gateway; DNS env)"
+        for _ns in $(split_list "$dns"); do echo "nameserver $_ns"; done
+    } > /etc/resolv.conf 2>/dev/null; then
+        log "[$SCRIPT_NAME] resolv.conf points at $dns (local traffic exits via '$local_gateway')"
+    else
+        log_error "[$SCRIPT_NAME] Warning: could not write /etc/resolv.conf"
+    fi
+fi
+
+log "[$SCRIPT_NAME] subnet=$vpn_subnet port=$listen_port wan=$wan_if mtu=$wg_mtu ipv6=$has_ipv6 local_gateway=$local_gateway"
+log "[$SCRIPT_NAME] Environment validated"

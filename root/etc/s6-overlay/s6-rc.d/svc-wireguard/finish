@@ -1,0 +1,7 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Tear wg0 down so a restart of the service starts clean. Upstream/exit
+# interfaces belong to init-upstreams and stay; the kill switch stays armed.
+. /usr/local/bin/backend-functions
+wg_if_destroy "$wg_if"
+exit 0

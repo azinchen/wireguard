@@ -1,0 +1,64 @@
+#!/bin/sh
+# shellcheck shell=sh
+#
+# Per-peer status from WireGuard itself: address, gateway, remote endpoint,
+# last handshake, traffic. Exit nodes and upstreams are listed with their
+# interface. --json for machines.
+
+set -u
+
+. /usr/local/bin/backend-functions
+
+MODE=text
+[ "${1:-}" = "--json" ] || [ "${1:-}" = "-j" ] && MODE=json
+
+now="$(date +%s)"
+hb() { awk -v b="$1" 'BEGIN { u = "B"; if (b >= 1024) { b /= 1024; u = "K" } if (b >= 1024) { b /= 1024; u = "M" } if (b >= 1024) { b /= 1024; u = "G" } if (u == "B") printf "%d%s", b, u; else printf "%.1f%s", b, u }'; }
+age() { [ "$1" = 0 ] && { echo never; return; }; awk -v s="$(( now - $1 ))" 'BEGIN { if (s < 0) s = 0; if (s < 120) printf "%ds", s; else if (s < 7200) printf "%dm", s / 60; else if (s < 172800) printf "%dh", s / 3600; else printf "%dd", s / 86400 }'; }
+jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+dump="$(wg_peer_dump "$wg_if")"
+rows=""
+json=""
+while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    name="$(peer_name_of "$rec")"
+    key="$(peer_opt "$rec" key)"
+    if [ "$(peer_opt "$rec" exit)" = "true" ]; then
+        ifn="wg-$name"
+        line="$(wg_peer_dump "$ifn" | head -1)"
+        gw="exit"
+    else
+        ifn="$wg_if"
+        line="$(printf '%s\n' "$dump" | awk -v k="$key" '$1 == k { print; exit }')"
+        gw="$(peer_effective_gw "$rec")"
+    fi
+    ep="$(printf '%s' "$line" | awk '{ print $2 }')"; hs="$(printf '%s' "$line" | awk '{ print $4 }')"
+    rx="$(printf '%s' "$line" | awk '{ print $5 }')"; tx="$(printf '%s' "$line" | awk '{ print $6 }')"
+    hs="${hs:-0}"; rx="${rx:-0}"; tx="${tx:-0}"; ep="${ep:-(none)}"
+    state=offline
+    [ "$(peer_opt "$rec" enabled)" = "true" ] || state=disabled
+    [ "$hs" != 0 ] && [ $((now - hs)) -lt 180 ] && state=online
+    rows="$rows
+$(printf '%-14s %-16s %-10s %-8s %-22s %-9s %s' "$name" "$(peer_opt "$rec" ip)" "$gw" "$state" "$ep" "$(age "$hs")" "$(hb "$rx")/$(hb "$tx")")"
+    json="$json,{\"name\":\"$(jesc "$name")\",\"address\":\"$(peer_opt "$rec" ip)\",\"address6\":\"$(peer_opt "$rec" ip6)\",\"interface\":\"$ifn\",\"exit\":$(peer_opt "$rec" exit),\"gateway\":\"$(jesc "$gw")\",\"state\":\"$state\",\"endpoint\":\"$(jesc "$ep")\",\"latest_handshake\":$hs,\"rx_bytes\":$rx,\"tx_bytes\":$tx}"
+done < "$peers_state"
+
+if [ "$MODE" = json ]; then
+    printf '{"interface":"%s","listen_port":%s,"server_public_key":"%s","peers":[%s]}\n' "$wg_if" "$listen_port" "$(server_pubkey)" "${json#,}"
+    exit 0
+fi
+echo "wireguard $image_version - $wg_if on UDP $listen_port, public key $(server_pubkey)"
+printf '%-14s %-16s %-10s %-8s %-22s %-9s %s\n' NAME ADDRESS GATEWAY STATE ENDPOINT HANDSHAKE RX/TX
+printf '%s\n' "${rows#
+}"
+if [ -d "$upstreams_dir" ]; then
+    for f in "$upstreams_dir"/*.conf; do
+        [ -f "$f" ] || continue
+        n="${f##*/}"; n="${n%.conf}"
+        line="$(wg_peer_dump "wg-$n" | head -1)"
+        hs="$(printf '%s' "$line" | awk '{ print $4 }')"; hs="${hs:-0}"
+        printf '%-14s %-16s %-10s %-8s %-22s %-9s %s\n' "$n" "(upstream)" "wg-$n" "$([ "$hs" != 0 ] && [ $((now - hs)) -lt 180 ] && echo online || echo offline)" \
+            "$(printf '%s' "$line" | awk '{ print $2 }')" "$(age "$hs")" "$(hb "$(printf '%s' "$line" | awk '{ print $5 }')")/$(hb "$(printf '%s' "$line" | awk '{ print $6 }')")"
+    done
+fi
