@@ -13,18 +13,18 @@ A WireGuard server for your devices with **zero-config peers**, **per-peer exits
 
 ## What you get
 
-- **Zero-config peers** — `PEERS=alice,bob` is a complete setup: keys, addresses, device configs and QR codes generated ([[Peers]])
-- **Bring your own keys** — a peer may give only its public key; no private key ever exists on the server ([Peers](Peers#options))
-- **Per-peer exits** — direct, an upstream VPN container, a WireGuard provider conf, or another peer ([[Gateway Mode]])
-- **Exit nodes** — `exit=true` turns a peer such as a home router into an exit; its config is generated for you ([[Exit Nodes and Upstreams]])
-- **Fail-closed kill switch** — if an upstream is down, its peers lose internet rather than leak ([Gateway Mode](Gateway-Mode#kill-switch-fail-closed))
-- **Hot reload** — edit the peers file and `wg-reload` applies it in place; unchanged peers keep their session ([Peers](Peers#hot-reload))
-- **DNS-named gateways** — name sidecars and endpoints by hostname; re-resolved and re-routed live ([Gateway Mode](Gateway-Mode#configuration))
-- **Sidecar mode** — `LOCAL_GATEWAY=<exit>` tunnels the container and its `network_mode: service:` clients ([[Sidecar Mode]])
-- **Opt-in health monitor** — `HEALTHCHECK` for the interface, routing tables and egress probes per gateway ([[Health Monitor]])
-- **Built-in reporting** — `peer-report` (handshakes, traffic, exit per peer) and `network-diagnostic` ([Troubleshooting](Troubleshooting#network-diagnostic))
-- **Kernel WireGuard, userspace fallback** — the host module when present, `wireguard-go` otherwise ([[Architecture and Internals]])
-- **Small multi-arch Alpine image** — 386, amd64, arm/v6, arm/v7, arm64, riscv64; s6-overlay, nftables only, no wg-quick ([[Building and CI]])
+- **Zero-config peers** — `PEERS=alice,bob` generates keys, addresses, configs and QR codes ([[Peers]])
+- **Bring your own keys** — a peer may give only its public key; no private key on the server ([Peers](Peers#options))
+- **Per-peer exits** — direct, an upstream VPN container, a provider conf, or another peer ([[Gateway Mode]])
+- **Exit nodes** — `exit=true` makes a peer such as a home router an exit; config generated ([[Exit Nodes and Upstreams]])
+- **Fail-closed kill switch** — if an upstream is down, its peers lose internet, never leak ([Gateway Mode](Gateway-Mode#kill-switch-fail-closed))
+- **Hot reload** — `wg-reload` applies the peers file in place, unchanged peers keep sessions ([Peers](Peers#hot-reload))
+- **DNS-named gateways** — sidecars and endpoints by hostname, re-resolved and re-routed live ([Gateway Mode](Gateway-Mode#configuration))
+- **Sidecar mode** — `LOCAL_GATEWAY` tunnels the container and `network_mode: service:` clients ([[Sidecar Mode]])
+- **Opt-in health monitor** — `HEALTHCHECK` for the interface, routing tables and egress probes ([[Health Monitor]])
+- **Built-in reporting** — `peer-report` shows handshake, traffic and exit per peer ([Troubleshooting](Troubleshooting#network-diagnostic))
+- **Kernel WireGuard** — uses the host module when present, falls back to `wireguard-go` ([[Architecture and Internals]])
+- **Small multi-arch Alpine image** — 386, amd64, arm/v6, arm/v7, arm64, riscv64 ([[Building and CI]])
 
 ---
 
