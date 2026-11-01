@@ -5,7 +5,7 @@ Both are a second WireGuard interface, `wg-<name>`, whose single peer owns `0.0.
 | | Exit node | Upstream conf |
 |---|---|---|
 | defined by | a peer line with `exit=true` | a file `UPSTREAMS_DIR/<name>.conf` |
-| config written by | this image (keys, addresses, port) - you import the result on the exit device | you (a provider download, a VPS you set up) |
+| config written by | this image (keys, addresses, port) — you import the result on the exit device | you (a provider download, a VPS you set up) |
 | typical remote | your home router, a Raspberry Pi, a VPS, **another container of this image** | Mullvad, Proton, AirVPN, a VPS, another container of this image |
 | direction | dial-in (remote behind NAT) or dial-out (`endpoint=`) | as the conf says (`Endpoint` present = dial-out) |
 
@@ -19,7 +19,7 @@ carol  gw=home
 dave   gw=vps
 ```
 
-The image allocates a transfer address pair from `EXIT_SUBNET` (ours / the remote's), a local keypair for our side, and for a dial-in node a UDP listen port (first free from `EXIT_PORT_BASE`, default `LISTEN_PORT+1`, persisted - **publish it**). It brings up `wg-home`, registers gateway `home` with `default dev wg-home` in its own table, and writes the config the exit device imports:
+The image allocates a transfer address pair from `EXIT_SUBNET` (ours / the remote's), a local keypair for our side, and for a dial-in node a UDP listen port (first free from `EXIT_PORT_BASE`, default `LISTEN_PORT+1`, persisted — **publish it**). It brings up `wg-home`, registers gateway `home` with `default dev wg-home` in its own table, and writes the config the exit device imports:
 
 ```bash
 docker exec wireguard peer-conf home          # or --qr
@@ -52,7 +52,7 @@ Adding or removing an exit node needs a container restart (interface + routing t
 
 ## Upstream confs (`UPSTREAMS_DIR`)
 
-Drop a standard wg-quick-style file into `/etc/wireguard/upstreams/<name>.conf` - a provider download works untouched:
+Drop a standard wg-quick-style file into `/etc/wireguard/upstreams/<name>.conf` — a provider download works untouched:
 
 ```
 # /etc/wireguard/upstreams/mullvad.conf
@@ -67,7 +67,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = se-sto-wg-001.relays.mullvad.net:51820
 ```
 
-Honoured: `PrivateKey`, `Address`, `ListenPort`, `MTU`, `PublicKey`, `PresharedKey`, `Endpoint`, `AllowedIPs`, `PersistentKeepalive`. **Ignored with a log line:** `DNS`, `Table`, `PreUp/PostUp/PreDown/PostDown` - the image routes by policy (a provider's `0.0.0.0/0` must never become the container's default route) and never executes commands from a downloaded file. The families the peer's `AllowedIPs` cover (and `Address` has) are the families the gateway routes; the rest is blocked for its peers. Only the first `[Peer]` is used. Names: 1-12 characters, letters/digits/`_`/`-`.
+Honoured: `PrivateKey`, `Address`, `ListenPort`, `MTU`, `PublicKey`, `PresharedKey`, `Endpoint`, `AllowedIPs`, `PersistentKeepalive`. **Ignored with a log line:** `DNS`, `Table`, `PreUp/PostUp/PreDown/PostDown` — the image routes by policy (a provider's `0.0.0.0/0` must never become the container's default route) and never executes commands from a downloaded file. The families the peer's `AllowedIPs` cover (and `Address` has) are the families the gateway routes; the rest is blocked for its peers. Only the first `[Peer]` is used. Names: 1-12 characters, letters/digits/`_`/`-`.
 
 The upstream is a gateway named after the file: `gw=mullvad`, `LOCAL_GATEWAY=mullvad`, `VPN_GATEWAY=wg:mullvad`.
 
@@ -83,7 +83,7 @@ docker exec wireguard-b peer-conf gate-a > a/upstreams/b.conf
 alice  gw=b             # alice -> A -> B -> internet
 ```
 
-The direction matters: the **exit side defines the peer** (so it forwards and NATs for it), the **entry side consumes the config as an upstream**. An `exit=true` node on A is the other shape - for a device that *terminates* A's exit traffic (a router with its own NAT), not for another instance of this image.
+The direction matters: the **exit side defines the peer** (so it forwards and NATs for it), the **entry side consumes the config as an upstream**. An `exit=true` node on A is the other shape — for a device that *terminates* A's exit traffic (a router with its own NAT), not for another instance of this image.
 
 ## Addresses and ports
 

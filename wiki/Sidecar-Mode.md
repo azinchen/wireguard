@@ -1,6 +1,6 @@
-# Sidecar Mode - a tunnel for other containers
+# Sidecar Mode — a tunnel for other containers
 
-With `LOCAL_GATEWAY=<exit>` the container's **own** traffic - and therefore every container started with `network_mode: service:wireguard` - leaves through that exit, and an **output kill switch** (policy drop) makes sure nothing leaves any other way. This is the role nordvpn-wg and openconnect-client play, with a generic WireGuard upstream (a provider conf, your VPS, or a peer config from another instance of this image) as the tunnel. Inbound peers on `wg0` are optional in this mode.
+With `LOCAL_GATEWAY=<exit>` the container's **own** traffic — and therefore every container started with `network_mode: service:wireguard` — leaves through that exit, and an **output kill switch** (policy drop) makes sure nothing leaves any other way. This is the role nordvpn-wg and openconnect-client play, with a generic WireGuard upstream (a provider conf, your VPS, or a peer config from another instance of this image) as the tunnel. Inbound peers on `wg0` are optional in this mode.
 
 ```yaml
 services:
@@ -29,7 +29,7 @@ Containers with their own network namespace, or LAN hosts, can be routed too:
 
 ## How it works
 
-- Every WireGuard socket the image creates carries the fwmark `WG_FWMARK` (`0xca6c`). One policy rule, `iif lo not fwmark 0xca6c lookup <table>`, steers locally generated traffic into the exit's routing table while WireGuard's own encrypted UDP keeps leaving via `eth0` - wg-quick's mechanism, done explicitly.
+- Every WireGuard socket the image creates carries the fwmark `WG_FWMARK` (`0xca6c`). One policy rule, `iif lo not fwmark 0xca6c lookup <table>`, steers locally generated traffic into the exit's routing table while WireGuard's own encrypted UDP keeps leaving via `eth0` — wg-quick's mechanism, done explicitly.
 - `table inet wg_gw` gains **output** and **input** chains with policy drop: accepted are `lo`, the tunnels, established flows, WireGuard's fwmarked UDP, DNS to the resolvers Docker configured (bootstrap, see below), neighbour discovery, the `LISTEN_PORT`/exit-node ports inbound, and `NETWORK`/`NETWORK6`.
 - `/etc/resolv.conf` is rewritten to `DNS` (default `1.1.1.1,1.0.0.1`), reached through the tunnel. Docker's embedded resolver would forward queries via the host, outside the tunnel. Hostnames in upstream `Endpoint`s are resolved through the resolvers Docker gave the container (saved before the rewrite), because that has to work before any tunnel exists; this is the only DNS that leaves off-tunnel.
 - Unmapped `wg0` peers are pinned to the main table explicitly, so the local rule does not swallow them.

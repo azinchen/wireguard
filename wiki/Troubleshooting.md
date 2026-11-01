@@ -46,7 +46,7 @@ A sidecar restarted with a new address, or a DDNS endpoint moved: `network-diagn
 
 ## Reload says nothing changed / rejects the file
 
-`wg-reload` validates everything first and aborts without touching live state on any error - the log says which line. New exit nodes and upstream confs need a restart. With `PEERS_WATCH=1` the watcher only reacts to the watched file's basename; writing a different file in the same directory does nothing.
+`wg-reload` validates everything first and aborts without touching live state on any error — the log says which line. New exit nodes and upstream confs need a restart. With `PEERS_WATCH=1` the watcher only reacts to the watched file's basename; writing a different file in the same directory does nothing.
 
 ## Inspecting by hand
 

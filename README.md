@@ -12,30 +12,30 @@
 [![Docker image size][dockerhub-size]][dockerhub-link]<br>
 [![Multi-arch][multiarch-badge]][dockerhub-link]
 
-A WireGuard **node** in a small self-configuring Docker container: a server for your devices with zero-config peer provisioning (keys, addresses, configs and QR codes generated for you), **per-peer exits** - straight out, through an upstream VPN container, through a WireGuard provider, or through **another peer** such as a home router - a fail-closed nftables kill switch on every path, and hot reload of everything without dropping tunnels. The same image is a WireGuard **sidecar** for other containers.
+A WireGuard **node** in a small self-configuring Docker container: a server for your devices with zero-config peer provisioning (keys, addresses, configs and QR codes generated for you), **per-peer exits** — straight out, through an upstream VPN container, through a WireGuard provider, or through **another peer** such as a home router — a fail-closed nftables kill switch on every path, and hot reload of everything without dropping tunnels. The same image is a WireGuard **sidecar** for other containers.
 
 > **Part of a family.** [**azinchen/ocserv-server**](https://github.com/azinchen/ocserv-server) (OpenConnect server) shares this image's gateway-mode contract; [**azinchen/nordvpn**](https://github.com/azinchen/nordvpn) and [**azinchen/nordvpn-wg**](https://github.com/azinchen/nordvpn-wg) plug in as upstream gateways; [**azinchen/openconnect-client**](https://github.com/azinchen/openconnect-client) is the OpenConnect sidecar counterpart.
 
 ## ✨ Key Features
 
-- **🧩 Zero-config peers** - `PEERS=alice,bob` is a complete setup: keys, pre-shared keys, stable addresses, device `.conf` files and QR codes are generated and persisted ([details][wiki-peers])
-- **🔑 Bring your own keys** - a peer may give only its public key; no private key ever exists on the server ([details][wiki-peers])
-- **🚪 Per-peer exits** - each peer leaves **direct**, via an **upstream VPN container** (NordVPN, any sidecar), via a **WireGuard provider** conf (Mullvad, your VPS), or via **another peer** acting as an exit node ([details][wiki-gateway])
-- **🏠 Exit nodes** - a peer line with `exit=true` becomes an exit: the image creates the tunnel interface, the keys, the listen port and the config the exit device imports; dial-in (behind NAT) and dial-out both work ([details][wiki-exits])
-- **🛡️ Fail-closed kill switch** - nftables guards on every path: an upstream that is down means no internet for its peers, never a leak ([details][wiki-killswitch])
-- **🔄 Hot reload** - edit the peers file and `wg-reload` (or `PEERS_WATCH=1`) applies it in place with `wg syncconf`: unchanged peers keep their session ([details][wiki-reload])
-- **🧭 DNS-named gateways** - name sidecars and endpoints by hostname; addresses are re-resolved live and re-routed without reconnects ([details][wiki-gateway])
-- **📦 Sidecar mode** - `LOCAL_GATEWAY=<exit>` steers the container's own traffic and `network_mode: service:` containers into a tunnel with an output kill switch ([details][wiki-sidecar])
-- **🩺 Opt-in health monitor** - Docker-native `HEALTHCHECK`: interface, routing tables, and real egress probes per gateway ([details][wiki-health])
-- **📊 Built-in reporting** - `peer-report` (handshakes, traffic, exit per peer) and `network-diagnostic` (public IP seen through every gateway) ([details][wiki-diag])
-- **🐧 Kernel WireGuard, userspace fallback** - uses the host module when present, `wireguard-go` otherwise
-- **📦 Multi-arch** - amd64 / arm64 / riscv64, Alpine + s6-overlay, nftables only, no wg-quick
+- **🧩 Zero-config peers** — `PEERS=alice,bob` is a complete setup: keys, addresses, device configs and QR codes generated ([details][wiki-peers])
+- **🔑 Bring your own keys** — a peer may give only its public key; no private key ever exists on the server ([details][wiki-peers])
+- **🚪 Per-peer exits** — direct, an upstream VPN container, a WireGuard provider conf, or another peer ([details][wiki-gateway])
+- **🏠 Exit nodes** — `exit=true` turns a peer such as a home router into an exit; its config is generated for you ([details][wiki-exits])
+- **🛡️ Fail-closed kill switch** — if an upstream is down, its peers lose internet rather than leak ([details][wiki-killswitch])
+- **🔄 Hot reload** — edit the peers file and `wg-reload` applies it in place; unchanged peers keep their session ([details][wiki-reload])
+- **🧭 DNS-named gateways** — name sidecars and endpoints by hostname; re-resolved and re-routed live ([details][wiki-gateway])
+- **🔗 Sidecar mode** — `LOCAL_GATEWAY=<exit>` tunnels the container and its `network_mode: service:` clients ([details][wiki-sidecar])
+- **🩺 Opt-in health monitor** — `HEALTHCHECK` for the interface, routing tables and egress probes per gateway ([details][wiki-health])
+- **📊 Built-in reporting** — `peer-report` (handshakes, traffic, exit per peer) and `network-diagnostic` ([details][wiki-diag])
+- **🐧 Kernel WireGuard, userspace fallback** — the host module when present, `wireguard-go` otherwise ([details][wiki-arch])
+- **📦 Small multi-arch Alpine image** — 386, amd64, arm/v6, arm/v7, arm64, riscv64; s6-overlay, nftables only, no wg-quick ([details][wiki-build])
 
-> **📖 [Full documentation on the Wiki][wiki-home]** - setup, peers, gateway mode, exit nodes, sidecar mode, configuration reference, troubleshooting, architecture.
+> **📖 [Full documentation on the Wiki][wiki-home]** — setup, peers, gateway mode, exit nodes, sidecar mode, configuration reference, troubleshooting, architecture.
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
 ```yaml
 # docker-compose.yml
@@ -64,17 +64,10 @@ docker exec wireguard peer-conf bob > bob.conf # or import the file
 docker exec wireguard peer-report              # who is connected, through which exit
 ```
 
-### Requirements
 
-| Setting | Why |
-|---|---|
-| `--cap-add=NET_ADMIN` | configure interfaces, routes, nftables |
-| `--sysctl net.ipv4.ip_forward=1` | forward peer traffic |
-| host WireGuard module (Linux 5.6+, or `wireguard` dkms) | kernel WireGuard; without it add `--device /dev/net/tun` and the image falls back to `wireguard-go` |
+## 🧩 Common Setups
 
-## Common Setups
-
-| I want to... | Guide |
+| I want to… | Guide |
 |---|---|
 | Run a plain WireGuard server for my devices | [Getting Started][wiki-start] · [Peers][wiki-peers] |
 | Send some peers out through NordVPN / another VPN container | [Gateway Mode][wiki-gateway] |
@@ -96,9 +89,9 @@ site-a  allowed=192.168.50.0/24  # a site behind the peer, reachable from the VP
 
 with `VPN_GATEWAYS=nl=nordvpn-wg` in the environment (a DNS name on the Docker network). `docker exec wireguard peer-conf home` prints the config the router imports.
 
-## Environment Variables
+## ⚙️ Environment Variables
 
-Grouped by feature; every variable is one line here - the **[Configuration Reference][wiki-config]** has the full descriptions.
+Grouped by feature; every variable is one line here — the **[Configuration Reference][wiki-config]** has the full descriptions.
 
 ### Core networking
 
@@ -113,7 +106,7 @@ Grouped by feature; every variable is one line here - the **[Configuration Refer
 | `TTL_SET` | _(unset)_ | Rewrite TTL/hop-limit of forwarded traffic on egress (e.g. `64`); hides hops behind this node from traceroutes. |
 | `PEER_TO_PEER` | `true` | Allow peers to reach each other through `wg0`. |
 
-### Peers - [details][wiki-peers]
+### Peers — [details][wiki-peers]
 
 | Variable | Default | Description |
 |---|---|---|
@@ -132,12 +125,12 @@ Grouped by feature; every variable is one line here - the **[Configuration Refer
 | `IPV6_NAT` | `0` | NAT66 for `IPV6_SUBNET`; peers only get an IPv6 address when IPv6 is actually routed. |
 | `IPV6_SUBNET` | `fda9:…::/64` | ULA peer subnet (`<prefix>::/64`). |
 
-### Gateway mode - [details][wiki-gateway]
+### Gateway mode — [details][wiki-gateway]
 
 | Variable | Default | Description |
 |---|---|---|
 | `VPN_GATEWAY` | _(unset)_ | Default exit for unmapped peers: IP/DNS name of an upstream container, `direct`, `block`, or `wg:<name>` (an exit node / upstream). |
-| `VPN_GATEWAY6` | _(unset)_ | Same for IPv6 (`block` by default - no leak). |
+| `VPN_GATEWAY6` | _(unset)_ | Same for IPv6 (`block` by default — no leak). |
 | `VPN_GATEWAYS` | _(unset)_ | Named gateways, e.g. `nl=nordvpn-wg,us=172.28.0.4,mullvad=wg`. |
 | `VPN_GATEWAYS6` | _(unset)_ | Optional IPv6 per gateway name. |
 | `VPN_GATEWAYS_FILE` | _(unset)_ | Gateways in a file (`name ipv4 [ipv6]`). |
@@ -147,7 +140,7 @@ Grouped by feature; every variable is one line here - the **[Configuration Refer
 | `VPN_PEER_GATEWAY_WATCH` | `0` | `1` = reload the map automatically on change. |
 | `VPN_GATEWAY_TABLE` / `VPN_GATEWAY_RULE_PRIO` / `VPN_GATEWAY_PEER_RULE_PRIO` | `100` / `1000` / `900` | Routing table base and rule priorities (advanced). |
 
-### Exit nodes and upstreams - [details][wiki-exits]
+### Exit nodes and upstreams — [details][wiki-exits]
 
 | Variable | Default | Description |
 |---|---|---|
@@ -156,7 +149,7 @@ Grouped by feature; every variable is one line here - the **[Configuration Refer
 | `UPSTREAMS_DIR` | `/etc/wireguard/upstreams` | Bring-your-own wg-quick-style confs (`<name>.conf`), each a gateway named `<name>`. |
 | `UPSTREAM_HANDSHAKE_TIMEOUT` | `180` | Seconds without a handshake before a dial-out endpoint is re-resolved. |
 
-### Sidecar mode - [details][wiki-sidecar]
+### Sidecar mode — [details][wiki-sidecar]
 
 | Variable | Default | Description |
 |---|---|---|
@@ -166,7 +159,7 @@ Grouped by feature; every variable is one line here - the **[Configuration Refer
 | `NETWORK` / `NETWORK6` | _(unset)_ | LAN CIDRs the kill switch keeps reachable off-tunnel. |
 | `DNS` | `1.1.1.1,1.0.0.1` | Resolvers written to `resolv.conf` in sidecar mode. |
 
-### Health monitor - [details][wiki-health]
+### Health monitor — [details][wiki-health]
 
 | Variable | Default | Description |
 |---|---|---|
@@ -174,7 +167,7 @@ Grouped by feature; every variable is one line here - the **[Configuration Refer
 | `HEALTH_CHECK_EGRESS` | _(unset)_ | Paths that also gate health: `direct`, gateway names, `default`, `upstreams`, `all` (join with `+`). |
 | `HEALTH_CHECK_URL` | `https://1.1.1.1/…` | URL(s) for the direct probe, `;`-separated. |
 
-## Operator commands
+## 🛠️ Operator Commands
 
 | Command | Purpose |
 |---|---|
@@ -185,27 +178,28 @@ Grouped by feature; every variable is one line here - the **[Configuration Refer
 | `network-diagnostic [--basic|--json|--explain <peer>]` | routing/kill-switch state, exit IP through every gateway |
 | `vpngw-gw-resolve` | force a re-resolve of DNS-named gateways and endpoints |
 
-## Build
+## 📋 Runtime Requirements
 
-```bash
-docker build -t wireguard .
-```
+- `--cap-add=NET_ADMIN` and `--sysctl net.ipv4.ip_forward=1` — interfaces, routes and nftables; forwarding peer traffic ([details][wiki-config])
+- a kernel with WireGuard support (5.6+ built in, or the `wireguard` module); without it the container falls back to userspace `wireguard-go`, which additionally needs `--device /dev/net/tun` and is slower ([details][wiki-arch])
+- a published UDP port for `wg0` (`51820` by default), plus one per dial-in exit node ([details][wiki-exits])
+- for IPv6 peers: `--sysctl net.ipv6.conf.all.forwarding=1` and an IPv6-routed Docker network ([details][wiki-config])
 
-Base: Alpine Linux · Init: s6-overlay · VPN: WireGuard (`wg` + kernel module, `wireguard-go` fallback) · Firewall: nftables
+## 🐛 Issues
 
-## Issues
+If you have any problems with or questions about this image, please open a [GitHub issue][github-issues-link].
 
-If you have any problems with or questions about this image, please contact me through a [GitHub issue][github-issues-link] or [email][email-link].
-
-Check the **[Troubleshooting][wiki-troubleshoot]** wiki page first - and attach the output of the built-in diagnostic to any report:
+Check the **[Troubleshooting][wiki-troubleshoot]** wiki page first — and attach the output of the built-in diagnostic to any report:
 
 ```bash
 docker exec wireguard network-diagnostic
 ```
 
-## License
+For how the container works under the hood, see **[Architecture and Internals][wiki-arch]**; for building it yourself, image tags and releases, **[Building and CI][wiki-build]**.
 
-[MIT](LICENSE)
+## 📄 License
+
+MIT — see [LICENSE](LICENSE).
 
 <!-- Links: GitHub -->
 [github-release]: https://img.shields.io/github/v/release/azinchen/wireguard?logo=github&logoColor=white
@@ -225,7 +219,7 @@ docker exec wireguard network-diagnostic
 [dockerhub-stars]: https://img.shields.io/docker/stars/azinchen/wireguard?logo=docker&logoColor=white
 [dockerhub-size]: https://img.shields.io/docker/image-size/azinchen/wireguard/latest?logo=docker&logoColor=white
 [dockerhub-link]: https://hub.docker.com/r/azinchen/wireguard
-[multiarch-badge]: https://img.shields.io/badge/multi--arch-amd64%20%7C%20arm64%20%7C%20riscv64-blue?logo=docker&logoColor=white
+[multiarch-badge]: https://img.shields.io/badge/multi--arch-386%20%7C%20amd64%20%7C%20arm%2Fv6%20%7C%20arm%2Fv7%20%7C%20arm64%20%7C%20riscv64-blue?logo=docker&logoColor=white
 
 <!-- Links: Wiki -->
 [wiki-home]: https://github.com/azinchen/wireguard/wiki
@@ -241,4 +235,5 @@ docker exec wireguard network-diagnostic
 [wiki-health]: https://github.com/azinchen/wireguard/wiki/Health-Monitor
 [wiki-diag]: https://github.com/azinchen/wireguard/wiki/Troubleshooting#network-diagnostic
 [wiki-troubleshoot]: https://github.com/azinchen/wireguard/wiki/Troubleshooting
-[email-link]: mailto:alexander@zinchenko.com
+[wiki-arch]: https://github.com/azinchen/wireguard/wiki/Architecture-and-Internals
+[wiki-build]: https://github.com/azinchen/wireguard/wiki/Building-and-CI

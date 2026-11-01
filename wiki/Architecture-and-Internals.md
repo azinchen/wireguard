@@ -11,9 +11,9 @@
 
 ## Multi-stage build
 
-1. **`s6-fetch`** - downloads the architecture-appropriate s6-overlay tarballs.
-2. **`rootfs`** - assembles `root/` (services, scripts) + s6; normalizes permissions; stamps the image version into `backend-functions`.
-3. **Final** - Alpine + runtime packages, one `COPY` of the rootfs, `ENTRYPOINT ["/init"]`, `S6_BEHAVIOUR_IF_STAGE2_FAILS=2` so a failed init oneshot aborts the container (fail-closed).
+1. **`s6-fetch`** — downloads the architecture-appropriate s6-overlay tarballs.
+2. **`rootfs`** — assembles `root/` (services, scripts) + s6; normalizes permissions; stamps the image version into `backend-functions`.
+3. **Final** — Alpine + runtime packages, one `COPY` of the rootfs, `ENTRYPOINT ["/init"]`, `S6_BEHAVIOUR_IF_STAGE2_FAILS=2` so a failed init oneshot aborts the container (fail-closed).
 
 ## Startup: the s6 service graph
 
@@ -33,11 +33,11 @@ init-env ─► init-nat ─► init-upstreams ─► init-vpngw ─► svc-wire
 
 ## Why no wg-quick
 
-wg-quick owns the default route (its fwmark + `suppress_prefixlength` trick), edits `resolv.conf`, runs hooks from the conf and needs bash. A node with several tunnels and policy routing needs none of that and must not have a provider conf take over its default route. The image uses `ip` + `wg setconf` to create interfaces and `wg syncconf` to reload peers without touching unchanged ones; the single piece of wg-quick behaviour it keeps - fwmarking WireGuard's own sockets so they are never routed into a tunnel - is explicit (`WG_FWMARK`).
+wg-quick owns the default route (its fwmark + `suppress_prefixlength` trick), edits `resolv.conf`, runs hooks from the conf and needs bash. A node with several tunnels and policy routing needs none of that and must not have a provider conf take over its default route. The image uses `ip` + `wg setconf` to create interfaces and `wg syncconf` to reload peers without touching unchanged ones; the single piece of wg-quick behaviour it keeps — fwmarking WireGuard's own sockets so they are never routed into a tunnel — is explicit (`WG_FWMARK`).
 
 ## Routing model
 
-Source policy routing keyed on peer addresses (static, so installed at boot and reconciled on reload - no connect hook as in ocserv-server):
+Source policy routing keyed on peer addresses (static, so installed at boot and reconciled on reload — no connect hook as in ocserv-server):
 
 - rule prio `900`: one `from <cidr> lookup <table>` per address of a mapped peer (its `/32` and every `allowed=` network); `direct` → `main`
 - rule prio `1000`: `from VPN_SUBNET lookup 100` for the subnet default (or `lookup main` in sidecar mode)

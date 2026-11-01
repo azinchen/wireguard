@@ -53,7 +53,7 @@ Lists use `+` as separator because `,` separates variables in compose and `;` is
     └── local.*, port                exit nodes: our side of the link and the listen port
 ```
 
-A peer removed from the definitions leaves `wg0` but keeps its directory, so re-adding it restores the same key and address. Address allocation is "lowest free host", skipping the server, every persisted address and every pin - nobody is ever renumbered.
+A peer removed from the definitions leaves `wg0` but keeps its directory, so re-adding it restores the same key and address. Address allocation is "lowest free host", skipping the server, every persisted address and every pin — nobody is ever renumbered.
 
 ## Device configs
 
@@ -91,6 +91,6 @@ docker exec wireguard wg-reload
 
 or set `PEERS_WATCH=1` to apply on every save. The reload is all-or-nothing: the new definitions are validated in full first, then the peer list is synced into `wg0` with `wg syncconf` (peers that did not change keep their handshake), routes for `allowed=` networks are added/removed, policy rules and kill-switch membership are reconciled, and device configs regenerated.
 
-Not reloadable: **adding** an exit node or an upstream conf (their interfaces and routing tables are created at boot - restart the container). Changing an existing exit node's key or endpoint is applied live.
+Not reloadable: **adding** an exit node or an upstream conf (their interfaces and routing tables are created at boot — restart the container). Changing an existing exit node's key or endpoint is applied live.
 
 Edit the file atomically (write a temp file, then `mv` over it) when a watcher is on, so a reload never reads a half-written file; editors do this by default.

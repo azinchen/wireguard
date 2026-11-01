@@ -1,4 +1,4 @@
-ARG ALPINE_VERSION=3.24.2
+ARG ALPINE_VERSION=3.24.3
 
 ############################
 # 1) Fetch s6-overlay (arch-aware)
@@ -117,9 +117,9 @@ RUN apk --no-cache --no-progress add \
     iproute2-minimal=7.0.0-r0 \
     nftables=1.1.6-r1 \
     libqrencode-tools=4.1.1-r3 \
-    bind-tools=9.20.29-r0 \
-    curl=8.22.0-r0 \
-    ca-certificates=20260909-r0 \
+    bind-tools=9.20.30-r0 \
+    curl=8.23.0-r0 \
+    ca-certificates=20261020-r0 \
     tzdata=2026e-r0
 
 # One COPY to bring everything in

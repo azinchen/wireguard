@@ -30,7 +30,7 @@ Everything you configure at the container level. Defaults are the in-image defau
 | Variable | Default | Description |
 |---|---|---|
 | `PEERS` | _(unset)_ | Inline peer list: `alice,bob` (keys generated) or `alice=<pubkey>` (device-made key). |
-| `PEERS_FILE` | `/etc/wireguard/peers.conf` | Peer definitions, one `name [option=value …]` per line, `#` comments; used when the file exists, wins over `PEERS` on a name. Options: `key psk ip ip6 allowed gw bypass dns routes keepalive enabled exit endpoint port` - see [[Peers]]. |
+| `PEERS_FILE` | `/etc/wireguard/peers.conf` | Peer definitions, one `name [option=value …]` per line, `#` comments; used when the file exists, wins over `PEERS` on a name. Options: `key psk ip ip6 allowed gw bypass dns routes keepalive enabled exit endpoint port` — see [[Peers]]. |
 | `PEERS_WATCH` | `0` | `1` = run `wg-reload` whenever the peers file changes. |
 | `PEER_DNS` | `1.1.1.1,1.0.0.1` | `DNS =` in generated device configs; per-peer `dns=`. |
 | `PEER_ROUTES` | `0.0.0.0/0,::/0` | Device-side `AllowedIPs` in generated configs; per-peer `routes=`. |

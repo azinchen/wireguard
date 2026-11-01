@@ -1,4 +1,4 @@
-# Gateway Mode - per-peer exits
+# Gateway Mode — per-peer exits
 
 Each peer leaves the server through one of:
 
@@ -6,7 +6,7 @@ Each peer leaves the server through one of:
 |---|---|---|
 | **direct** | `direct` (also the default for unmapped peers) | the container's own default route (your ISP) |
 | **next-hop gateway** | an IP or DNS name on a Docker network | a [nordvpn-wg](https://github.com/azinchen/nordvpn-wg) / [nordvpn](https://github.com/azinchen/nordvpn) sidecar with `FORWARD_FROM`, an ocserv-server, any router |
-| **WireGuard upstream** | `wg:<name>` / an exit node or upstream name | a provider conf (Mullvad, Proton, your VPS) or **another peer** acting as exit node - see [[Exit Nodes and Upstreams]] |
+| **WireGuard upstream** | `wg:<name>` / an exit node or upstream name | a provider conf (Mullvad, Proton, your VPS) or **another peer** acting as exit node — see [[Exit Nodes and Upstreams]] |
 | **block** | `block` | the peer's forwarded traffic is rejected |
 
 ```
@@ -36,7 +36,7 @@ environment:
 | `VPN_GATEWAYS_RESOLVE_INTERVAL` | Re-resolve DNS names and upstream endpoints every N seconds; moved addresses are re-routed in place. |
 | `VPN_GATEWAY_TABLE`, `VPN_GATEWAY_RULE_PRIO`, `VPN_GATEWAY_PEER_RULE_PRIO` | Table base (`100`; gateways use 101, 102, …) and rule priorities (`1000` subnet default, `900` per peer). |
 
-Exit nodes (`exit=true` peers) and upstream confs are registered as gateways **under their own name** automatically - `VPN_GATEWAYS` is only needed for next-hop gateways or to alias.
+Exit nodes (`exit=true` peers) and upstream confs are registered as gateways **under their own name** automatically — `VPN_GATEWAYS` is only needed for next-hop gateways or to alias.
 
 ## Mapping peers
 
@@ -66,9 +66,9 @@ The policy routes already force peer traffic to its exit; `table inet wg_gw` mak
 
 | Gateway kind | Guard |
 |---|---|
-| next-hop IP | `ip saddr @gw_nl_v4 oifname "eth0" rt ip nexthop != 172.28.0.2 drop` - may leave the WAN only toward that next-hop |
-| WireGuard upstream / exit node | `ip saddr @gw_home_v4 oifname != { "wg-home", "wg0" } drop` - may leave only through its own tunnel (or to other peers) |
-| blocked family | `reject with icmp admin-prohibited` - fails fast, the device falls back to the other family |
+| next-hop IP | `ip saddr @gw_nl_v4 oifname "eth0" rt ip nexthop != 172.28.0.2 drop` — may leave the WAN only toward that next-hop |
+| WireGuard upstream / exit node | `ip saddr @gw_home_v4 oifname != { "wg-home", "wg0" } drop` — may leave only through its own tunnel (or to other peers) |
+| blocked family | `reject with icmp admin-prohibited` — fails fast, the device falls back to the other family |
 | subnet default | the same guard for the whole `VPN_SUBNET` |
 
 | Situation | Result |
@@ -81,7 +81,7 @@ The forward chain of `table inet wg` is policy **drop** as well; only `wg0 → W
 
 ## Upstream requirements
 
-A next-hop gateway must forward this container's Docker-network address out its tunnel: peers are **masqueraded** onto this container's address before they reach the gateway, so it needs no route back to `VPN_SUBNET`. With nordvpn / nordvpn-wg that is `FORWARD_FROM=<docker network subnet>`; with ocserv-server, nothing - it masquerades too.
+A next-hop gateway must forward this container's Docker-network address out its tunnel: peers are **masqueraded** onto this container's address before they reach the gateway, so it needs no route back to `VPN_SUBNET`. With nordvpn / nordvpn-wg that is `FORWARD_FROM=<docker network subnet>`; with ocserv-server, nothing — it masquerades too.
 
 ## Verify
 
