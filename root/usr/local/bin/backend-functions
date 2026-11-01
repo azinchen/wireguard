@@ -72,6 +72,9 @@ exit_subnet6="${EXIT_SUBNET6:-fda9:4efe:7e3b:03eb::/64}"
 exit_port_base="${EXIT_PORT_BASE:-}"
 upstreams_dir="${UPSTREAMS_DIR:-/etc/wireguard/upstreams}"
 upstream_handshake_timeout="${UPSTREAM_HANDSHAKE_TIMEOUT:-180}"
+# How often the always-on endpoint watch looks at handshake ages (internal)
+upstream_check_interval=30
+[ "$upstream_handshake_timeout" -lt 30 ] 2>/dev/null && upstream_check_interval="$upstream_handshake_timeout"
 
 # ---- Sidecar role ----------------------------------------------------------
 local_gateway="${LOCAL_GATEWAY:-direct}"
@@ -285,7 +288,7 @@ gw_resolve_all() {
     _st="$(awk -v h="$2" '$1 !~ /^#/ { for (i = 2; i <= NF; i++) if ($i == h) print $1 }' /etc/hosts 2>/dev/null | grep -E "$_pat" || true)"
     if [ -n "$_st" ]; then printf '%s\n' "$_st" | awk '!seen[$1]++'; return 0; fi
     for _ns in $(bootstrap_nameservers); do
-        _r="$(dig +short +time=2 +tries=1 "@$_ns" "$_rr" "$2" 2>/dev/null | grep -E "$_pat" || true)"
+        _r="$(dig +short +time=2 +tries=2 "@$_ns" "$_rr" "$2" 2>/dev/null | grep -E "$_pat" || true)"
         if [ -n "$_r" ]; then printf '%s\n' "$_r" | awk '!seen[$1]++'; return 0; fi
     done
     getent "$_db" "$2" 2>/dev/null | awk '!seen[$1]++ { print $1 }'
@@ -1305,6 +1308,16 @@ vpngw_reconcile_gateways() {
     return 0
 }
 
+# True when at least one dial-out tunnel has a DNS-named endpoint
+upstreams_have_dns_endpoints() {
+    for _ef in "$state_dir"/ifaces/*.endpoint; do
+        [ -f "$_ef" ] || continue
+        read -r _ _h _ _ < "$_ef" || continue
+        gw_is_literal "$_h" || return 0
+    done
+    return 1
+}
+
 # Age in seconds of the latest handshake of interface $1 (empty = never)
 wg_handshake_age() {
     _hs="$(wg show "$1" latest-handshakes 2>/dev/null | awk '{ print $2; exit }')"
@@ -1313,11 +1326,21 @@ wg_handshake_age() {
 }
 
 # Re-resolve dial-out exit nodes' / upstreams' Endpoint hostnames.
-# State: $state_dir/ifaces/<iface>.endpoint = "pubkey host port current_ip".
+# State: $state_dir/ifaces/<iface>.endpoint = "pubkey host port current_ip";
+# <iface>.endpoint.reset holds the epoch of the last re-set.
 # The endpoint is re-set when the address moved, or when the tunnel has had no
 # handshake for UPSTREAM_HANDSHAKE_TIMEOUT (a re-set kicks a fresh handshake
 # at the - possibly new - address). Literal-IP endpoints are left alone.
+# The address family is sticky: a name is re-resolved in the family of its
+# current address, so one failed or slow lookup never flips a working IPv4
+# endpoint to an IPv6 one the container may not be able to reach; a lookup
+# failure keeps the current address and is retried on the next pass.
+# $1 = "stale-only": leave tunnels with a fresh handshake alone (no DNS query);
+# this is the always-on watch (wg-quick's reresolve-dns), while the scheduled
+# VPN_GATEWAYS_RESOLVE_INTERVAL pass also follows a moved name proactively.
 upstreams_reconcile() {
+    _mode="${1:-}"
+    _now="$(date +%s)"
     for _ef in "$state_dir"/ifaces/*.endpoint; do
         [ -f "$_ef" ] || continue
         _ifn="${_ef##*/}"; _ifn="${_ifn%.endpoint}"
@@ -1326,7 +1349,18 @@ upstreams_reconcile() {
         _stale=0
         _age="$(wg_handshake_age "$_ifn")" || _age=""
         if [ -z "$_age" ] || [ "$_age" -gt "$upstream_handshake_timeout" ]; then _stale=1; fi
-        _new="$(gw_resolve_stable -4 "$_host" "$_cur" 2>/dev/null)" || _new="$(gw_resolve_stable -6 "$_host" "$_cur" 2>/dev/null)" || _new=""
+        [ "$_mode" = "stale-only" ] && [ "$_stale" = 0 ] && continue
+        # One re-set per timeout window: give the new handshake time to happen
+        if [ "$_stale" = 1 ]; then
+            _last="$(cat "$_ef.reset" 2>/dev/null || echo 0)"
+            [ $((_now - _last)) -ge "$upstream_handshake_timeout" ] || _stale=0
+            [ "$_mode" = "stale-only" ] && [ "$_stale" = 0 ] && continue
+        fi
+        case "$_cur" in
+            unresolved) _new="$(gw_resolve_one -4 "$_host" 2>/dev/null)" || _new="$(gw_resolve_one -6 "$_host" 2>/dev/null)" || _new="" ;;
+            *:*)        _new="$(gw_resolve_stable -6 "$_host" "$_cur" 2>/dev/null)" || _new="" ;;
+            *)          _new="$(gw_resolve_stable -4 "$_host" "$_cur" 2>/dev/null)" || _new="" ;;
+        esac
         if [ -z "$_new" ]; then
             log_error "[UPSTREAM-RESOLVE] $_ifn: cannot resolve '$_host'; keeping $_cur"
             continue
@@ -1337,6 +1371,7 @@ upstreams_reconcile() {
                 [ "$_new" != "$_cur" ] && log "[UPSTREAM-RESOLVE] $_ifn: endpoint $_host moved $_cur -> $_new" \
                     || log "[UPSTREAM-RESOLVE] $_ifn: no handshake for ${_age:-ever}s; endpoint re-set to $_new"
                 printf '%s %s %s %s\n' "$_pub" "$_host" "$_port" "$_new" > "$_ef"
+                echo "$_now" > "$_ef.reset"
             else
                 log_error "[UPSTREAM-RESOLVE] $_ifn: wg set endpoint $_epstr failed"
             fi

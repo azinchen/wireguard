@@ -1,16 +1,31 @@
 #!/command/with-contenv sh
 # shellcheck shell=sh
 #
-# Optional poller that keeps DNS-named gateways and upstream endpoints fresh
-# (VPN_GATEWAYS_RESOLVE_INTERVAL seconds). Idles when disabled.
+# Keeps DNS names fresh. Two jobs:
+#  - every VPN_GATEWAYS_RESOLVE_INTERVAL seconds (when > 0): re-resolve every
+#    DNS-named gateway and dial-out endpoint, re-route / re-set when moved;
+#  - always, when a dial-out tunnel has a DNS-named Endpoint: re-resolve and
+#    re-set an endpoint whose handshake is older than UPSTREAM_HANDSHAKE_TIMEOUT
+#    (DDNS moved, provider rotated), checked every upstream_check_interval s.
+# Idles when neither applies.
 
 set -eu
 
 . /usr/local/bin/backend-functions
 
-case "$vpn_gateways_resolve_interval" in ''|*[!0-9]*|0) exec sleep infinity ;; esac
-log "[VPNGW-RESOLVE] Re-resolving gateway hosts and upstream endpoints every ${vpn_gateways_resolve_interval}s"
-while :; do
-    sleep "$vpn_gateways_resolve_interval"
-    /usr/local/bin/vpngw-gw-resolve || true
-done
+case "$vpn_gateways_resolve_interval" in ''|*[!0-9]*) vpn_gateways_resolve_interval=0 ;; esac
+if [ "$vpn_gateways_resolve_interval" -gt 0 ]; then
+    log "[VPNGW-RESOLVE] Re-resolving gateway hosts and upstream endpoints every ${vpn_gateways_resolve_interval}s"
+    while :; do
+        sleep "$vpn_gateways_resolve_interval"
+        /usr/local/bin/vpngw-gw-resolve || true
+    done
+elif upstreams_have_dns_endpoints; then
+    log "[VPNGW-RESOLVE] Watching dial-out endpoints: re-resolve after ${upstream_handshake_timeout}s without a handshake (checked every ${upstream_check_interval}s)"
+    while :; do
+        sleep "$upstream_check_interval"
+        /usr/local/bin/vpngw-gw-resolve --endpoints || true
+    done
+else
+    exec sleep infinity
+fi

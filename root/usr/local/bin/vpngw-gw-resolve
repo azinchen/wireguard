@@ -4,6 +4,8 @@
 # Re-resolve DNS-named gateways and upstream endpoints; re-route in place
 # when an address moved (see vpngw_reconcile_gateways / upstreams_reconcile).
 # Run manually or every VPN_GATEWAYS_RESOLVE_INTERVAL seconds by the service.
+# With --endpoints only dial-out endpoints whose handshake is stale are
+# re-resolved (the always-on watch; nothing else is touched).
 
 set -u
 
@@ -12,6 +14,10 @@ set -u
 [ -d "$vpngw_state_dir" ] || { log_error "[VPNGW-RESOLVE] Not initialised"; exit 1; }
 (
     flock 9
-    vpngw_reconcile_gateways
-    upstreams_reconcile
+    if [ "${1:-}" = "--endpoints" ]; then
+        upstreams_reconcile stale-only
+    else
+        vpngw_reconcile_gateways
+        upstreams_reconcile
+    fi
 ) 9>"$wg_lock"

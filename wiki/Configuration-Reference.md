@@ -53,7 +53,7 @@ Everything you configure at the container level. Defaults are the in-image defau
 | `VPN_GATEWAYS` | _(unset)_ | Named gateways `name=addr,…`; `addr` is an IP, a DNS name, `block`, `wg` (= `wg:<name>`) or `wg:<other>`. Names: letters, digits, `_`, `-`. Exit nodes and upstreams are gateways of their own name automatically. |
 | `VPN_GATEWAYS6` | _(unset)_ | Optional IPv6 per gateway name. A gateway without IPv6 blocks its peers' IPv6. |
 | `VPN_GATEWAYS_FILE` | _(unset)_ | `name ipv4 [ipv6]` lines, `#` comments; merged per field with the variables, file wins. |
-| `VPN_GATEWAYS_RESOLVE_INTERVAL` | `0` | Seconds between re-resolving DNS-named gateways **and** dial-out tunnel endpoints (`0` = off). A moved address is re-routed in place; a name that fails to resolve keeps its last address. `vpngw-gw-resolve` forces one pass. |
+| `VPN_GATEWAYS_RESOLVE_INTERVAL` | `0` | Seconds between re-resolving DNS-named gateways **and** dial-out tunnel endpoints (`0` = off), as in ocserv-server. A moved address is re-routed / re-set in place; a name that fails to resolve keeps its last address. `vpngw-gw-resolve` forces one pass. Independent of this, DNS-named endpoints are always re-resolved when their handshake goes stale (`UPSTREAM_HANDSHAKE_TIMEOUT`). |
 | `VPN_PEER_GATEWAY` | _(unset)_ | Peer → gateway map `alice=nl,bob=direct`. The `gw=` option in the peers file wins; unmapped peers follow `VPN_GATEWAY`. |
 | `VPN_PEER_GATEWAY_FILE` | _(unset)_ | The map in a file (`peer gateway` or `peer=gateway` lines); merged, file wins; hot-reload with `wg-reload`. |
 | `VPN_PEER_GATEWAY_WATCH` | `0` | `1` = reload automatically when that file changes. |
@@ -70,7 +70,7 @@ Everything you configure at the container level. Defaults are the in-image defau
 | `EXIT_SUBNET6` | `fda9:4efe:7e3b:03eb::/64` | Same for IPv6 (used when IPv6 is routed). |
 | `EXIT_PORT_BASE` | `LISTEN_PORT+1` | First UDP port handed to dial-in exit nodes (next free, persisted). Publish them. |
 | `UPSTREAMS_DIR` | `/etc/wireguard/upstreams` | Bring-your-own wg-quick-style confs, `<name>.conf` → interface `wg-<name>`, gateway `<name>`. `DNS`, `Table` and hooks are ignored. |
-| `UPSTREAM_HANDSHAKE_TIMEOUT` | `180` | Seconds without a handshake on a dial-out tunnel before its endpoint is re-resolved and re-set (also the `upstreams` health criterion). |
+| `UPSTREAM_HANDSHAKE_TIMEOUT` | `180` | Seconds without a handshake on a dial-out tunnel before its DNS-named endpoint is re-resolved and re-set (checked every 30 s, always on, like wg-quick's reresolve-dns); also the `upstreams` health criterion. |
 | `WG_FWMARK` | `0xca6c` | fwmark on every WireGuard socket (keeps encrypted UDP out of the tunnels). |
 
 ## Sidecar mode

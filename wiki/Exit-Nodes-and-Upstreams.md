@@ -45,7 +45,7 @@ PersistentKeepalive = 25
 What the exit device has to do: import the config, forward, and NAT packets from our transfer address out its uplink. Because this image masquerades peer traffic onto the `wg-home` address, the remote needs **no route to `VPN_SUBNET`** and sees exactly one source address. On OpenWrt / Keenetic / MikroTik this is "add the WireGuard interface to the WAN-NAT zone"; on a Linux box it is the two commented lines.
 
 - **Dial-in** (no `endpoint=`): for a device behind NAT. We listen on the assigned port; the device keeps the tunnel up with `PersistentKeepalive`. Publish the port (`ports: ["51821:51821/udp"]`).
-- **Dial-out** (`endpoint=host:port`): for a server with a public address. The device must listen on that port; the generated config has `ListenPort` and no `Endpoint`. Hostnames are re-resolved every `VPN_GATEWAYS_RESOLVE_INTERVAL` seconds and re-set when they move or after `UPSTREAM_HANDSHAKE_TIMEOUT` seconds without a handshake (DDNS).
+- **Dial-out** (`endpoint=host:port`): for a server with a public address. The device must listen on that port; the generated config has `ListenPort` and no `Endpoint`. A hostname is re-resolved and the endpoint re-set after `UPSTREAM_HANDSHAKE_TIMEOUT` seconds without a handshake (always on, for DDNS and provider rotation); with `VPN_GATEWAYS_RESOLVE_INTERVAL` set it is additionally re-resolved on that schedule and followed as soon as it moves.
 - `key=<pubkey>` keeps the private key on the device, as for any peer.
 
 Adding or removing an exit node needs a container restart (interface + routing table); changing its key, endpoint or pre-shared key is applied by `wg-reload`.
@@ -92,7 +92,7 @@ The direction matters: the **exit side defines the peer** (so it forwards and NA
 | `EXIT_SUBNET` / `EXIT_SUBNET6` | `10.10.11.0/24` / `fda9:4efe:7e3b:03eb::/64` | transfer addresses (one pair per exit node, persisted in `peers/<name>/address` and `local.address`) |
 | `EXIT_PORT_BASE` | `LISTEN_PORT+1` | first dial-in port; persisted in `peers/<name>/port` |
 | `UPSTREAMS_DIR` | `/etc/wireguard/upstreams` | |
-| `UPSTREAM_HANDSHAKE_TIMEOUT` | `180` | seconds without a handshake before a dial-out endpoint is re-resolved |
+| `UPSTREAM_HANDSHAKE_TIMEOUT` | `180` | seconds without a handshake before a DNS-named dial-out endpoint is re-resolved and re-set (always on) |
 
 ## MTU
 

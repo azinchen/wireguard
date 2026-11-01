@@ -133,7 +133,7 @@ Grouped by feature; every variable is one line here — the **[Configuration Ref
 | `VPN_GATEWAYS` | _(unset)_ | Named gateways, e.g. `nl=nordvpn-wg,us=172.28.0.4,mullvad=wg`. |
 | `VPN_GATEWAYS6` | _(unset)_ | Optional IPv6 per gateway name. |
 | `VPN_GATEWAYS_FILE` | _(unset)_ | Gateways in a file (`name ipv4 [ipv6]`). |
-| `VPN_GATEWAYS_RESOLVE_INTERVAL` | `0` | Re-resolve DNS-named gateways and upstream endpoints every N seconds. |
+| `VPN_GATEWAYS_RESOLVE_INTERVAL` | `0` | Re-resolve DNS-named gateways and dial-out endpoints every N seconds, re-routing moved addresses in place. |
 | `VPN_PEER_GATEWAY` | _(unset)_ | Peer → gateway map, e.g. `alice=nl,bob=direct` (the `gw=` option in the peers file wins). |
 | `VPN_PEER_GATEWAY_FILE` | _(unset)_ | The map in a file; hot-reload with `wg-reload`. |
 | `VPN_PEER_GATEWAY_WATCH` | `0` | `1` = reload the map automatically on change. |
@@ -146,7 +146,7 @@ Grouped by feature; every variable is one line here — the **[Configuration Ref
 | `EXIT_SUBNET` / `EXIT_SUBNET6` | `10.10.11.0/24` / `fda9:…:03eb::/64` | Transfer addresses for exit nodes. |
 | `EXIT_PORT_BASE` | `LISTEN_PORT+1` | First UDP port handed to dial-in exit nodes (publish them). |
 | `UPSTREAMS_DIR` | `/etc/wireguard/upstreams` | Bring-your-own wg-quick-style confs (`<name>.conf`), each a gateway named `<name>`. |
-| `UPSTREAM_HANDSHAKE_TIMEOUT` | `180` | Seconds without a handshake before a dial-out endpoint is re-resolved. |
+| `UPSTREAM_HANDSHAKE_TIMEOUT` | `180` | Seconds without a handshake before a DNS-named dial-out endpoint is re-resolved and re-set (always on). |
 
 ### Sidecar mode — [details][wiki-sidecar]
 

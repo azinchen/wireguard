@@ -33,7 +33,7 @@ environment:
 | `VPN_GATEWAY` / `VPN_GATEWAY6` | Default exit for **unmapped** peers: IP / DNS name, `direct`, `block`, or `wg:<name>`. IPv6 defaults to `block` whenever any gateway is configured (no leak); set `VPN_GATEWAY6=direct` to keep IPv6 on the ISP. |
 | `VPN_GATEWAYS` / `VPN_GATEWAYS6` | `name=addr` pairs. `addr` is an IP, a DNS name, `block`, `wg` (the exit node / upstream of the same name) or `wg:<other>`. |
 | `VPN_GATEWAYS_FILE` | `name ipv4 [ipv6]` lines; merged per field, file wins. |
-| `VPN_GATEWAYS_RESOLVE_INTERVAL` | Re-resolve DNS names and upstream endpoints every N seconds; moved addresses are re-routed in place. |
+| `VPN_GATEWAYS_RESOLVE_INTERVAL` | Re-resolve DNS names and dial-out endpoints every N seconds; moved addresses are re-routed in place (dial-out endpoints are also re-resolved whenever their handshake goes stale, regardless of this setting). |
 | `VPN_GATEWAY_TABLE`, `VPN_GATEWAY_RULE_PRIO`, `VPN_GATEWAY_PEER_RULE_PRIO`, `VPN_LOCAL_RULE_PRIO` | Table base (`100`; gateways use 101, 102, …) and rule priorities (`1000` subnet default, `900` per peer, `800` local destinations). |
 
 Exit nodes (`exit=true` peers) and upstream confs are registered as gateways **under their own name** automatically — `VPN_GATEWAYS` is only needed for next-hop gateways or to alias.

@@ -29,7 +29,7 @@ init-env ─► init-nat ─► init-upstreams ─► init-vpngw ─► svc-wire
 | **init-upstreams** | brings up `wg-<name>` for every exit node (config generated from the record) and every `UPSTREAMS_DIR/*.conf` (sanitised); resolves `Endpoint` hostnames; records each interface's families in `/run/wireguard/ifaces/`. |
 | **init-vpngw** | named gateways → routing tables (`default via <ip>` or `default dev wg-<name>`); peer map; subnet default; `LOCAL_GATEWAY` rule; kill switch `inet wg_gw`; per-peer policy rules and set membership. State in `/run/wireguard/vpngw/`. |
 | **svc-wireguard** | creates `wg0` (`ip link add` + `wg setconf`), adds the server address and `allowed=` routes, then blocks; `SIGHUP` → `wg-reload`; `finish` removes `wg0`. |
-| **watchers** | `inotifyd` on the peers file / map file (`PEERS_WATCH`, `VPN_PEER_GATEWAY_WATCH`); the resolver loop (`VPN_GATEWAYS_RESOLVE_INTERVAL`). |
+| **watchers** | `inotifyd` on the peers file / map file (`PEERS_WATCH`, `VPN_PEER_GATEWAY_WATCH`); the resolver loop: scheduled re-resolution of gateways and endpoints (`VPN_GATEWAYS_RESOLVE_INTERVAL`), or, without it, the always-on endpoint watch that re-resolves a dial-out endpoint once its handshake is older than `UPSTREAM_HANDSHAKE_TIMEOUT`. |
 
 ## Why no wg-quick
 
