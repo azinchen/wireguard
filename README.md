@@ -103,7 +103,7 @@ Grouped by feature; every variable is one line here — the **[Configuration Ref
 | `MTU` | `1420` | `wg0` MTU. |
 | `MSS` | _(unset)_ | Hard TCP MSS cap for forwarded traffic (default: clamp to interface MTU). |
 | `TTL_SET` | _(unset)_ | Rewrite TTL/hop-limit of forwarded traffic on egress (e.g. `64`); hides hops behind this node from traceroutes. |
-| `PEER_TO_PEER` | `true` | Allow peers to reach each other through `wg0`. |
+| `PEER_TO_PEER` | `true` | Allow peers to reach each other through `wg0` (peer-to-peer traffic never enters a gateway). |
 
 ### Peers — [details][wiki-peers]
 
@@ -137,7 +137,7 @@ Grouped by feature; every variable is one line here — the **[Configuration Ref
 | `VPN_PEER_GATEWAY` | _(unset)_ | Peer → gateway map, e.g. `alice=nl,bob=direct` (the `gw=` option in the peers file wins). |
 | `VPN_PEER_GATEWAY_FILE` | _(unset)_ | The map in a file; hot-reload with `wg-reload`. |
 | `VPN_PEER_GATEWAY_WATCH` | `0` | `1` = reload the map automatically on change. |
-| `VPN_GATEWAY_TABLE` / `VPN_GATEWAY_RULE_PRIO` / `VPN_GATEWAY_PEER_RULE_PRIO` | `100` / `1000` / `900` | Routing table base and rule priorities (advanced). |
+| `VPN_GATEWAY_TABLE` / `VPN_GATEWAY_RULE_PRIO` / `VPN_GATEWAY_PEER_RULE_PRIO` / `VPN_LOCAL_RULE_PRIO` | `100` / `1000` / `900` / `800` | Routing table base and rule priorities (advanced). |
 
 ### Exit nodes and upstreams — [details][wiki-exits]
 

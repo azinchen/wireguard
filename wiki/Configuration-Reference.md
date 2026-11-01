@@ -60,6 +60,7 @@ Everything you configure at the container level. Defaults are the in-image defau
 | `VPN_GATEWAY_TABLE` | `100` | Routing table of the subnet default; named gateways use 101, 102, … |
 | `VPN_GATEWAY_RULE_PRIO` | `1000` | Priority of the `from VPN_SUBNET` rule. |
 | `VPN_GATEWAY_PEER_RULE_PRIO` | `900` | Priority of the per-peer rules (must be lower = stronger). |
+| `VPN_LOCAL_RULE_PRIO` | `800` | Priority of the `to <peer subnet / allowed= network> lookup main` rules that keep peer-to-peer traffic on `wg0` whatever gateway the sender is mapped to (must be lower than the per-peer rules). |
 
 ## Exit nodes and upstreams
 

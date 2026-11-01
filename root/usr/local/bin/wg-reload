@@ -95,6 +95,7 @@ ip link show "$wg_if" >/dev/null 2>&1 || { log_error "[WG-RELOAD] $wg_if is not 
     for c in $old_routes; do printf '%s\n' "$new_routes" | grep -qxF "$c" || ip route del "$c" dev "$wg_if" 2>/dev/null || true; done
     for c in $new_routes; do printf '%s\n' "$old_routes" | grep -qxF "$c" || ip route replace "$c" dev "$wg_if" 2>/dev/null || true; done
     printf '%s\n' "$new_routes" | sed '/^$/d' > "$state_dir/allowed_routes"
+    vpngw_local_rules_sync || log_error "[WG-RELOAD] Warning: could not rebuild the local-destination rules"
 
     # 4. policy rules + kill-switch membership: remove gone/changed, add new/changed
     changed=0

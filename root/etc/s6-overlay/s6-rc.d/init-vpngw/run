@@ -22,7 +22,7 @@ mkdir -p "$vpngw_state_dir/applied"
 date +%s > "$vpngw_state_dir/started"
 
 # Clean leftovers of a previous run (service restart inside one container life)
-for prio in "$vpn_gateway_rule_prio" "$vpn_gateway_peer_rule_prio" "$local_gateway_rule_prio"; do
+for prio in "$vpn_local_rule_prio" "$vpn_gateway_rule_prio" "$vpn_gateway_peer_rule_prio" "$local_gateway_rule_prio"; do
     for fam in -4 -6; do
         n=0
         while [ "$n" -lt 256 ] && ip $fam rule del priority "$prio" 2>/dev/null; do n=$((n + 1)); done
@@ -104,6 +104,10 @@ done < "$state_dir/ifaces/list"
 # ---- Peer -> gateway map and per-peer validation -------------------------------
 vpngw_build_peer_map || fatal "invalid VPN_PEER_GATEWAY map"
 peers_check_gateways || fatal "peer definitions reference unknown gateways"
+
+# ---- Local destinations: peer subnets and allowed= networks stay on wg0 ---------
+vpngw_local_rules_sync || fatal "could not install the local-destination rules"
+log "[$SCRIPT_NAME] Local destinations ($vpn_subnet$(ipv6_routed && printf ', %s' "$ipv6_subnet"), allowed= networks) stay on $wg_if (priority $vpn_local_rule_prio)"
 
 # ---- Subnet default for unmapped peers -------------------------------------------
 table="$vpn_gateway_table"

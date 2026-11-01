@@ -34,7 +34,7 @@ environment:
 | `VPN_GATEWAYS` / `VPN_GATEWAYS6` | `name=addr` pairs. `addr` is an IP, a DNS name, `block`, `wg` (the exit node / upstream of the same name) or `wg:<other>`. |
 | `VPN_GATEWAYS_FILE` | `name ipv4 [ipv6]` lines; merged per field, file wins. |
 | `VPN_GATEWAYS_RESOLVE_INTERVAL` | Re-resolve DNS names and upstream endpoints every N seconds; moved addresses are re-routed in place. |
-| `VPN_GATEWAY_TABLE`, `VPN_GATEWAY_RULE_PRIO`, `VPN_GATEWAY_PEER_RULE_PRIO` | Table base (`100`; gateways use 101, 102, …) and rule priorities (`1000` subnet default, `900` per peer). |
+| `VPN_GATEWAY_TABLE`, `VPN_GATEWAY_RULE_PRIO`, `VPN_GATEWAY_PEER_RULE_PRIO`, `VPN_LOCAL_RULE_PRIO` | Table base (`100`; gateways use 101, 102, …) and rule priorities (`1000` subnet default, `900` per peer, `800` local destinations). |
 
 Exit nodes (`exit=true` peers) and upstream confs are registered as gateways **under their own name** automatically — `VPN_GATEWAYS` is only needed for next-hop gateways or to alias.
 
@@ -59,6 +59,8 @@ $ docker exec wireguard ip rule
 900:   from 10.10.10.5 lookup main     # a 'direct' peer when VPN_GATEWAY steers the rest
 1000:  from 10.10.10.0/24 lookup 100   # unmapped peers -> VPN_GATEWAY
 ```
+
+A peer's gateway decides where its traffic for the **internet** goes. Traffic for **other peers** (the peer subnet and every `allowed=` network behind a peer) always stays on `wg0`: `to <cidr> lookup main` rules at priority `800` are consulted before any gateway rule, so `alice gw=nl` still reaches `bob` and `site-a` directly. Whether peers may talk to each other at all is `PEER_TO_PEER`.
 
 ## Kill switch (fail-closed)
 

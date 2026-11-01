@@ -39,6 +39,7 @@ wg-quick owns the default route (its fwmark + `suppress_prefixlength` trick), ed
 
 Source policy routing keyed on peer addresses (static, so installed at boot and reconciled on reload — no connect hook as in ocserv-server):
 
+- rule prio `800`: `to <cidr> lookup main` for `VPN_SUBNET`, `IPV6_SUBNET` (when routed) and every `allowed=` network — peer-to-peer traffic never enters a gateway table
 - rule prio `900`: one `from <cidr> lookup <table>` per address of a mapped peer (its `/32` and every `allowed=` network); `direct` → `main`
 - rule prio `1000`: `from VPN_SUBNET lookup 100` for the subnet default (or `lookup main` in sidecar mode)
 - rule prio `1100`: `iif lo not fwmark 0xca6c lookup <table>` for `LOCAL_GATEWAY`

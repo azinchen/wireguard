@@ -64,6 +64,7 @@ vpn_peer_gateway="${VPN_PEER_GATEWAY:-}"
 vpn_peer_gateway_file="${VPN_PEER_GATEWAY_FILE:-}"
 vpn_peer_gateway_watch="${VPN_PEER_GATEWAY_WATCH:-0}"
 vpn_gateway_peer_rule_prio="${VPN_GATEWAY_PEER_RULE_PRIO:-900}"
+vpn_local_rule_prio="${VPN_LOCAL_RULE_PRIO:-800}"
 
 # ---- Exit nodes and upstreams ---------------------------------------------
 exit_subnet="${EXIT_SUBNET:-10.10.11.0/24}"
@@ -921,6 +922,40 @@ peer_cidrs6() {
     [ "$_v6" != "-" ] && ipv6_routed && printf '%s/128\n' "$_v6"
     _al="$(peer_opt "$1" allowed)"
     [ "$_al" != "-" ] && printf '%s\n' "$_al" | tr '+' '\n' | while read -r _c; do is_cidr6 "$_c" && printf '%s\n' "$_c"; done
+    return 0
+}
+
+# Destinations inside this node - the peer subnets and every allowed= network
+# behind a peer - are reached through wg0 whatever gateway the *source* is
+# mapped to: "to <cidr> lookup main" rules ahead of the per-peer, subnet and
+# local rules. Without them a peer mapped to a gateway would send its traffic
+# for other peers out through that gateway (its table only has a default
+# route). Whether peers may actually talk is PEER_TO_PEER's forward rule.
+# Idempotent: rebuilds the whole set at its priority. Returns 1 on failure.
+vpngw_local_rules_sync() {
+    _lp="$vpn_local_rule_prio"
+    for _fam in -4 -6; do
+        _n=0
+        while [ "$_n" -lt 256 ] && ip $_fam rule del priority "$_lp" 2>/dev/null; do _n=$((_n + 1)); done
+    done
+    ip rule add to "$vpn_subnet" lookup main priority "$_lp" || return 1
+    if ipv6_routed; then
+        ip -6 rule add to "$ipv6_subnet" lookup main priority "$_lp" || return 1
+    fi
+    while IFS= read -r _rec; do
+        [ -n "$_rec" ] || continue
+        [ "$(peer_opt "$_rec" exit)" = "true" ] && continue
+        [ "$(peer_opt "$_rec" enabled)" = "true" ] || continue
+        _al="$(peer_opt "$_rec" allowed)"
+        [ "$_al" != "-" ] || continue
+        for _c in $(printf '%s' "$_al" | tr '+' ' '); do
+            if is_cidr4 "$_c"; then
+                ip rule add to "$_c" lookup main priority "$_lp" || return 1
+            elif ipv6_routed; then
+                ip -6 rule add to "$_c" lookup main priority "$_lp" || return 1
+            fi
+        done
+    done < "$peers_state"
     return 0
 }
 
