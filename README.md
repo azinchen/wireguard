@@ -64,7 +64,6 @@ docker exec wireguard peer-conf bob > bob.conf # or import the file
 docker exec wireguard peer-report              # who is connected, through which exit
 ```
 
-
 ## 🧩 Common Setups
 
 | I want to… | Guide |
