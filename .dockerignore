@@ -7,7 +7,6 @@
 .claude
 scripts
 test
-docker-compose.yml
 docker-compose.override.yml
 LICENSE
 *.md
