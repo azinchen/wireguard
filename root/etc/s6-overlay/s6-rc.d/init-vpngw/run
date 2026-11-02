@@ -22,7 +22,7 @@ mkdir -p "$vpngw_state_dir/applied"
 date +%s > "$vpngw_state_dir/started"
 
 # Clean leftovers of a previous run (service restart inside one container life)
-for prio in "$vpn_local_rule_prio" "$vpn_gateway_rule_prio" "$vpn_gateway_peer_rule_prio" "$local_gateway_rule_prio"; do
+for prio in "$vpn_local_rule_prio" "$vpn_gateway_rule_prio" "$vpn_gateway_peer_rule_prio" "$wg_mark_rule_prio" "$local_gateway_rule_prio"; do
     for fam in -4 -6; do
         n=0
         while [ "$n" -lt 256 ] && ip $fam rule del priority "$prio" 2>/dev/null; do n=$((n + 1)); done
@@ -159,14 +159,19 @@ if [ "$local_gateway" != "direct" ]; then
     [ -n "$line" ] || fatal "LOCAL_GATEWAY '$local_gateway' is not a defined gateway (VPN_GATEWAYS, exit node or upstream)"
     ltable="$(echo "$line" | awk '{ print $2 }')"
     lg4="$(echo "$line" | awk '{ print $3 }')"; lg6="$(echo "$line" | awk '{ print $4 }')"
-    # Locally generated packets (iif lo) except WireGuard's own fwmarked UDP
-    [ "$lg4" != block ] && ip rule add iif lo not fwmark "$wg_fwmark" lookup "$ltable" priority "$local_gateway_rule_prio"
+    # WireGuard's own fwmarked UDP keeps leaving via the main table (rule in front
+    # of every source rule, see wg_mark_rule_prio); everything else the container
+    # originates (iif lo) takes the exit's table. Not one "iif lo not fwmark" rule:
+    # the kernel inverts a whole rule, so forwarded packets would match it too.
+    ip rule add fwmark "$wg_fwmark" lookup main priority "$wg_mark_rule_prio"
+    [ "$lg4" != block ] && ip rule add iif lo lookup "$ltable" priority "$local_gateway_rule_prio"
     if ipv6_available; then
+        ip -6 rule add fwmark "$wg_fwmark" lookup main priority "$wg_mark_rule_prio" || true
         if [ "$lg6" != block ]; then
-            ip -6 rule add iif lo not fwmark "$wg_fwmark" lookup "$ltable" priority "$local_gateway_rule_prio" || true
+            ip -6 rule add iif lo lookup "$ltable" priority "$local_gateway_rule_prio" || true
         else
             # gateway has no IPv6: send local v6 nowhere (unreachable) rather than the ISP
-            ip -6 rule add iif lo not fwmark "$wg_fwmark" unreachable priority "$local_gateway_rule_prio" 2>/dev/null || true
+            ip -6 rule add iif lo unreachable priority "$local_gateway_rule_prio" 2>/dev/null || true
         fi
     fi
     printf '%s %s\n' "$local_gateway" "$ltable" > "$vpngw_state_dir/local"

@@ -79,6 +79,12 @@ upstream_check_interval=30
 # ---- Sidecar role ----------------------------------------------------------
 local_gateway="${LOCAL_GATEWAY:-direct}"
 local_gateway_rule_prio="${LOCAL_GATEWAY_RULE_PRIO:-1100}"
+# WireGuard's own fwmarked UDP always takes the main table: this rule sits in
+# front of every source-based rule, because the encrypted packets of a sidecar
+# carry the container's own address, which may lie inside FORWARD_FROM. (A
+# single "iif lo not fwmark" rule would not do either: the kernel inverts a
+# whole rule, so forwarded traffic would match it too.)
+wg_mark_rule_prio="${WG_MARK_RULE_PRIO:-700}"
 forward_from="${FORWARD_FROM:-}"
 forward_from6="${FORWARD_FROM6:-}"
 gateway_nat6="$(to_bool "${GATEWAY_NAT6:-true}")"
@@ -941,10 +947,9 @@ vpngw_local_rules_sync() {
         _n=0
         while [ "$_n" -lt 256 ] && ip $_fam rule del priority "$_lp" 2>/dev/null; do _n=$((_n + 1)); done
     done
-    ip rule add to "$vpn_subnet" lookup main priority "$_lp" || return 1
-    if ipv6_routed; then
-        ip -6 rule add to "$ipv6_subnet" lookup main priority "$_lp" || return 1
-    fi
+    # every destination that must stay on the main table, each CIDR once
+    _l4="$vpn_subnet"; _l6=""
+    ipv6_routed && _l6="$ipv6_subnet"
     while IFS= read -r _rec; do
         [ -n "$_rec" ] || continue
         [ "$(peer_opt "$_rec" exit)" = "true" ] && continue
@@ -952,13 +957,23 @@ vpngw_local_rules_sync() {
         _al="$(peer_opt "$_rec" allowed)"
         [ "$_al" != "-" ] || continue
         for _c in $(printf '%s' "$_al" | tr '+' ' '); do
-            if is_cidr4 "$_c"; then
-                ip rule add to "$_c" lookup main priority "$_lp" || return 1
-            elif ipv6_routed; then
-                ip -6 rule add to "$_c" lookup main priority "$_lp" || return 1
-            fi
+            if is_cidr4 "$_c"; then _l4="$_l4 $_c"; elif ipv6_routed; then _l6="$_l6 $_c"; fi
         done
     done < "$peers_state"
+    # LAN (NETWORK) and FORWARD_FROM clients: the container's own replies to them
+    # must leave via the main table, never through the exit
+    _l4="$_l4 $(split_list "$network" | tr '\n' ' ')"
+    [ -s "$state_dir/forward_from4" ] && _l4="$_l4 $(tr '\n' ' ' < "$state_dir/forward_from4")"
+    if ipv6_available; then
+        _l6="$_l6 $(split_list "$network6" | tr '\n' ' ')"
+        [ -s "$state_dir/forward_from6" ] && _l6="$_l6 $(tr '\n' ' ' < "$state_dir/forward_from6")"
+    fi
+    for _c in $(printf '%s\n' $_l4 | sort -u); do
+        ip rule add to "$_c" lookup main priority "$_lp" || return 1
+    done
+    for _c in $(printf '%s\n' $_l6 | sort -u); do
+        ip -6 rule add to "$_c" lookup main priority "$_lp" || return 1
+    done
     return 0
 }
 

@@ -29,7 +29,7 @@ Containers with their own network namespace, or LAN hosts, can be routed too:
 
 ## How it works
 
-- Every WireGuard socket the image creates carries the fwmark `WG_FWMARK` (`0xca6c`). One policy rule, `iif lo not fwmark 0xca6c lookup <table>`, steers locally generated traffic into the exit's routing table while WireGuard's own encrypted UDP keeps leaving via `eth0` — wg-quick's mechanism, done explicitly.
+- Every WireGuard socket the image creates carries the fwmark `WG_FWMARK` (`0xca6c`). Two policy rules steer locally generated traffic: `fwmark 0xca6c lookup main` (priority 700, in front of every source rule) keeps WireGuard's own encrypted UDP leaving via `eth0` even when the container's address lies inside `FORWARD_FROM`, and `iif lo lookup <table>` (priority 1100) sends everything else the container originates into the exit's routing table — wg-quick's mechanism, done explicitly. (A single `iif lo not fwmark` rule would not do: the kernel inverts the whole rule, so forwarded traffic would match it too.) Destinations in `NETWORK` and `FORWARD_FROM` are pinned to the main table at priority 800, so the container's own replies to LAN hosts and to its clients never enter the tunnel.
 - `table inet wg_gw` gains **output** and **input** chains with policy drop: accepted are `lo`, the tunnels, established flows, WireGuard's fwmarked UDP, DNS to the resolvers Docker configured (bootstrap, see below), neighbour discovery, the `LISTEN_PORT`/exit-node ports inbound, and `NETWORK`/`NETWORK6`.
 - `/etc/resolv.conf` is rewritten to `DNS` (default `1.1.1.1,1.0.0.1`), reached through the tunnel. Docker's embedded resolver would forward queries via the host, outside the tunnel. Hostnames in upstream `Endpoint`s are resolved through the resolvers Docker gave the container (saved before the rewrite), because that has to work before any tunnel exists; this is the only DNS that leaves off-tunnel.
 - Unmapped `wg0` peers are pinned to the main table explicitly, so the local rule does not swallow them.
@@ -43,6 +43,7 @@ Containers with their own network namespace, or LAN hosts, can be routed too:
 | `DNS` | `1.1.1.1,1.0.0.1` | resolvers for `resolv.conf` |
 | `WG_FWMARK` | `0xca6c` | fwmark on WireGuard sockets (change only on a collision) |
 | `LOCAL_GATEWAY_RULE_PRIO` | `1100` | priority of the local rule |
+| `WG_MARK_RULE_PRIO` | `700` | priority of the rule keeping WireGuard's fwmarked UDP on the main table (must be below every source rule) |
 
 `GATEWAY_DNS` interception (as in the sibling images) is not implemented yet and is refused if set.
 

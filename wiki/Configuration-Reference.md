@@ -83,6 +83,7 @@ Everything you configure at the container level. Defaults are the in-image defau
 | `NETWORK` / `NETWORK6` | _(unset)_ | LAN CIDRs the kill switch keeps reachable off-tunnel (in and out). |
 | `DNS` | `1.1.1.1,1.0.0.1` | Resolvers written to `/etc/resolv.conf` in sidecar mode. |
 | `LOCAL_GATEWAY_RULE_PRIO` | `1100` | Priority of the local-traffic rule (must be above `VPN_GATEWAY_RULE_PRIO`). |
+| `WG_MARK_RULE_PRIO` | `700` | Priority of the rule that keeps WireGuard's own fwmarked UDP on the main table; must stay below `VPN_LOCAL_RULE_PRIO` and every source rule. |
 | `GATEWAY_DNS` / `GATEWAY_DNS_SERVER` | `off` | Reserved (phase 3); any other value is refused. |
 
 ## Health monitor

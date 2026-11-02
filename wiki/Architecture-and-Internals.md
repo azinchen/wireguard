@@ -42,7 +42,8 @@ Source policy routing keyed on peer addresses (static, so installed at boot and 
 - rule prio `800`: `to <cidr> lookup main` for `VPN_SUBNET`, `IPV6_SUBNET` (when routed) and every `allowed=` network — peer-to-peer traffic never enters a gateway table
 - rule prio `900`: one `from <cidr> lookup <table>` per address of a mapped peer (its `/32` and every `allowed=` network); `direct` → `main`
 - rule prio `1000`: `from VPN_SUBNET lookup 100` for the subnet default (or `lookup main` in sidecar mode)
-- rule prio `1100`: `iif lo not fwmark 0xca6c lookup <table>` for `LOCAL_GATEWAY`
+- rule prio `700`: `fwmark 0xca6c lookup main` — WireGuard's own encrypted UDP always uses the main table, ahead of every source rule (`WG_MARK_RULE_PRIO`)
+- rule prio `1100`: `iif lo lookup <table>` for `LOCAL_GATEWAY`
 - tables `101, 102, …`: one per named gateway, `default via <next-hop>` or `default dev wg-<name>`
 
 Kill switch `inet wg_gw` (forward hook, priority −10): per-gateway guards (next-hop guard or interface guard), `direct`/`block` sets, the subnet default guard; in sidecar mode also `output`/`input` chains with policy drop.
