@@ -29,7 +29,7 @@ A WireGuard **node** in a small self-configuring Docker container: a server for 
 - **🩺 Opt-in health monitor** — `HEALTHCHECK` for the interface, routing tables and egress probes ([details][wiki-health])
 - **📊 Built-in reporting** — `peer-report` shows handshake, traffic and exit per peer ([details][wiki-diag])
 - **🐧 Kernel WireGuard** — uses the host module when present, falls back to `wireguard-go` ([details][wiki-arch])
-- **📦 Small multi-arch Alpine image** — 386, amd64, arm/v6, arm/v7, arm64, riscv64 ([details][wiki-build])
+- **📦 Small multi-arch Alpine image** — 386, amd64, arm/v6, arm/v7, arm64 ([details][wiki-build])
 
 > **📖 [Full documentation on the Wiki][wiki-home]** — setup, peers, gateway mode, exit nodes, sidecar mode, configuration reference, troubleshooting, architecture.
 
@@ -218,7 +218,7 @@ MIT — see [LICENSE](LICENSE).
 [dockerhub-stars]: https://img.shields.io/docker/stars/azinchen/wireguard?logo=docker&logoColor=white
 [dockerhub-size]: https://img.shields.io/docker/image-size/azinchen/wireguard/latest?logo=docker&logoColor=white
 [dockerhub-link]: https://hub.docker.com/r/azinchen/wireguard
-[multiarch-badge]: https://img.shields.io/badge/multi--arch-386%20%7C%20amd64%20%7C%20arm%2Fv6%20%7C%20arm%2Fv7%20%7C%20arm64%20%7C%20riscv64-blue?logo=docker&logoColor=white
+[multiarch-badge]: https://img.shields.io/badge/multi--arch-386%20%7C%20amd64%20%7C%20arm%2Fv6%20%7C%20arm%2Fv7%20%7C%20arm64-blue?logo=docker&logoColor=white
 
 <!-- Links: Wiki -->
 [wiki-home]: https://github.com/azinchen/wireguard/wiki

@@ -31,7 +31,7 @@ The build stages are described in [Architecture and Internals](Architecture-and-
 The image installs WireGuard from Alpine packages rather than building anything from source:
 
 - `wireguard-tools-wg` — the bare `wg` binary. The image creates interfaces with `ip` + `wg setconf` and reloads peers with `wg syncconf`; it never uses `wg-quick` (nor its bash dependency), see [Architecture and Internals](Architecture-and-Internals#why-no-wg-quick).
-- `wireguard-go` — the userspace fallback for hosts without the kernel module. It is pinned to its upstream version with a floating Alpine revision (`~`), because the riscv64 package builder lags the other architectures by a revision for days at a time, which would otherwise break the multi-arch build.
+- `wireguard-go` — the userspace fallback for hosts without the kernel module. It is pinned to its upstream version with a floating Alpine revision (`~`). That was needed while riscv64 was published, because its package builder lagged the other architectures by a revision for days at a time; riscv64 is no longer published, so an exact pin would work again.
 - `libqrencode-tools` renders peer configs as QR codes; `nftables` and `iproute2-minimal` do the firewall and policy routing; `curl` and `bind-tools` serve the health-check probes and DNS re-resolution.
 
 ## Version pinning
@@ -55,7 +55,7 @@ Alpine and s6-overlay are pinned via the `ARG` lines above and bumped by CI (bel
 | `maintenance-cleanup` | weekly schedule, manual | Prunes old GHCR and Docker Hub tags with [container-registry-pruner](https://github.com/azinchen/container-registry-pruner); dry-run by default when run manually |
 | `wiki-publish` | tag push, manual | Mirrors the repository's `wiki/` folder into the GitHub wiki, so the published wiki always matches the latest release |
 
-Dependabot keeps the GitHub Actions versions current with weekly PRs. Platform matrix for `main` and releases: `linux/386, linux/amd64, linux/arm/v6, linux/arm/v7, linux/arm64, linux/riscv64`.
+Dependabot keeps the GitHub Actions versions current with weekly PRs. Platform matrix for `main` and releases: `linux/386, linux/amd64, linux/arm/v6, linux/arm/v7, linux/arm64`. `linux/riscv64` (published up to 0.9.1) was dropped: Alpine builds its riscv64 packages and the official `alpine` Docker image on slower hardware, so they land hours to days after the other architectures and repeatedly blocked the multi-arch build. The Dockerfile still supports it for local builds (`docker buildx build --platform linux/riscv64 .`).
 
 ### Bot PR labels
 

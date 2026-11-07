@@ -109,8 +109,9 @@ LABEL org.opencontainers.image.title="WireGuard VPN Docker container" \
 # dependency). wireguard-go is the userspace fallback for hosts without the
 # kernel module; libqrencode-tools renders peer configs as QR codes.
 # wireguard-go is pinned to its upstream version with a floating Alpine
-# revision (~): the riscv64 builder lags the other architectures by a
-# revision for days at a time, which would break the multi-arch build.
+# revision (~). This was needed while riscv64 was published, because its
+# builder lagged the other architectures by a revision for days at a time;
+# riscv64 is no longer published, so an exact pin would work again.
 RUN apk --no-cache --no-progress add \
     wireguard-tools-wg=1.0.20260223-r0 \
     wireguard-go~0.0.20250522 \
