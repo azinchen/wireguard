@@ -24,7 +24,7 @@ A WireGuard server for your devices with **zero-config peers**, **per-peer exits
 - **Opt-in health monitor** — `HEALTHCHECK` for the interface, routing tables and egress probes ([[Health Monitor]])
 - **Built-in reporting** — `peer-report` shows handshake, traffic and exit per peer ([Troubleshooting](Troubleshooting#network-diagnostic))
 - **Kernel WireGuard** — uses the host module when present, falls back to `wireguard-go` ([[Architecture and Internals]])
-- **Small multi-arch Alpine image** — 386, amd64, arm/v6, arm/v7, arm64, riscv64 ([[Building and CI]])
+- **Small multi-arch Alpine image** — 386, amd64, arm/v6, arm/v7, arm64 ([[Building and CI]])
 
 ---
 
